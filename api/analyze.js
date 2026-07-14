@@ -1,9 +1,9 @@
 // Vercel 서버리스 함수 (Node 런타임, CommonJS)
 // 브라우저가 아니라 서버에서만 실행 → Gemini API 키가 사용자에게 노출되지 않음.
 // 필요한 환경변수: GEMINI_API_KEY (Vercel 대시보드에서 설정)
-// (선택) GEMINI_MODEL — 기본 gemini-flash-latest (항상 최신 flash 별칭)
+// (선택) GEMINI_MODEL — 기본 gemini-flash-lite-latest (빠르고 가벼운 최신 flash-lite 별칭)
 
-const DEFAULT_MODEL = 'gemini-flash-latest';
+const DEFAULT_MODEL = 'gemini-flash-lite-latest';
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 
 const systemInstruction = `당신은 원서를 읽는 한국인 학습자를 위한 영어 구문 분석 전문가입니다.
@@ -125,7 +125,12 @@ module.exports = async function handler(req, res) {
     const payload = {
       systemInstruction: { parts: [{ text: systemInstruction }] },
       contents,
-      generationConfig: { responseMimeType: 'application/json', responseSchema },
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema,
+        maxOutputTokens: 8192,
+        thinkingConfig: { thinkingBudget: 0 },
+      },
     };
 
     const url =
