@@ -9,6 +9,12 @@
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script>
+      // JSX를 classic 런타임(React.createElement)으로 변환 — 브라우저 인라인 스크립트용
+      Babel.registerPreset('classic-react', {
+        presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]],
+      });
+    </script>
     <style>
       @keyframes spin { to { transform: rotate(360deg); } }
       .spin { animation: spin 1s linear infinite; }
@@ -17,7 +23,7 @@
   <body>
     <div id="root"></div>
 
-    <script type="text/babel" data-presets="react">
+    <script type="text/babel" data-presets="classic-react">
       const { useState, useEffect } = React;
 
       // 이미지 축소 + JPEG 압축 (전송량/토큰 절약, 함수 본문 한도 회피)
