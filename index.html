@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+    <meta name="theme-color" content="#4f46e5" />
+    <title>Chunk & Catch — 직독직해 도우미</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .spin { animation: spin 1s linear infinite; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="react">
+      const { useState, useEffect } = React;
+
+      // 이미지 축소 + JPEG 압축 (전송량/토큰 절약, 함수 본문 한도 회피)
+      const downscaleImage = (file, maxSize = 1600, quality = 0.85) =>
+        new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(new Error('파일을 읽을 수 없습니다.'));
+          reader.onload = () => {
+            const img = new Image();
+            img.onerror = () => reject(new Error('이미지를 불러올 수 없습니다.'));
+            img.onload = () => {
+              let { width, height } = img;
+              if (width > maxSize || height > maxSize) {
+                const ratio = Math.min(maxSize / width, maxSize / height);
+                width = Math.round(width * ratio);
+                height = Math.round(height * ratio);
+              }
+              const canvas = document.createElement('canvas');
+              canvas.width = width;
+              canvas.height = height;
+              canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+              const dataUrl = canvas.toDataURL('image/jpeg', quality);
+              resolve({ dataUrl, base64: dataUrl.split(',')[1], mimeType: 'image/jpeg' });
+            };
+            img.src = reader.result;
+          };
+          reader.readAsDataURL(file);
+        });
+
+      function App() {
+        const [activeTab, setActiveTab] = useState('text');
+        const [textInput, setTextInput] = useState('');
+        const [imagePreview, setImagePreview] = useState(null);
+        const [base64Image, setBase64Image] = useState(null);
+        const [mimeType, setMimeType] = useState(null);
+        const [isLoading, setIsLoading] = useState(false);
+        const [result, setResult] = useState(null);
+        const [error, setError] = useState('');
+
+        useEffect(() => {
+          if ('speechSynthesis' in window) {
+            const warm = () => window.speechSynthesis.getVoices();
+            warm();
+            window.speechSynthesis.addEventListener('voiceschanged', warm);
+            return () => window.speechSynthesis.removeEventListener('voiceschanged', warm);
+          }
+        }, []);
+
+        const handleSpeak = (text, langCode) => {
+          if ('speechSynthesis' in window) {
+            window.speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(text);
+            u.rate = 0.9;
+            u.lang = langCode;
+            const voices = window.speechSynthesis.getVoices();
+            const voice =
+              voices.find((v) => v.lang.includes(langCode) && v.localService) ||
+              voices.find((v) => v.lang.includes(langCode));
+            if (voice) u.voice = voice;
+            window.speechSynthesis.speak(u);
+          } else {
+            setError('현재 브라우저에서는 음성 듣기 기능을 지원하지 않습니다. Chrome, Safari, Edge 등을 사용해 주세요.');
+          }
+        };
+
+        const processImageFile = async (file) => {
+          if (!file) return;
+          try {
+            const { dataUrl, base64, mimeType: mt } = await downscaleImage(file);
+            setImagePreview(dataUrl);
+            setBase64Image(base64);
+            setMimeType(mt);
+          } catch (e) {
+            console.error(e);
+            setError('이미지를 처리하지 못했습니다. 다른 파일로 시도해 주세요.');
+          }
+        };
+
+        const handleImageUpload = (e) => processImageFile(e.target.files[0]);
+
+        useEffect(() => {
+          const handlePaste = (e) => {
+            if (activeTab !== 'image') return;
+            const items = e.clipboardData && e.clipboardData.items;
+            if (!items) return;
+            for (let i = 0; i < items.length; i++) {
+              if (items[i].type.indexOf('image') !== -1) {
+                processImageFile(items[i].getAsFile());
+                e.preventDefault();
+                break;
+              }
+            }
+          };
+          window.addEventListener('paste', handlePaste);
+          return () => window.removeEventListener('paste', handlePaste);
+        }, [activeTab]);
+
+        const analyzeContent = async () => {
+          setError('');
+          setResult(null);
+          if (activeTab === 'text' && !textInput.trim()) return setError('분석할 영어 문장을 입력해 주세요.');
+          if (activeTab === 'image' && !base64Image) return setError('분석할 이미지를 업로드해 주세요.');
+
+          setIsLoading(true);
+          try {
+            const body =
+              activeTab === 'text'
+                ? { mode: 'text', text: textInput }
+                : { mode: 'image', imageData: base64Image, mimeType };
+            const res = await fetch('/api/analyze', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error((data && data.error) || ('요청 실패 (' + res.status + ')'));
+            if (!data.sentences) throw new Error('결과를 받아오지 못했습니다.');
+            setResult(data);
+          } catch (e) {
+            console.error(e);
+            setError(e.message || '분석 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.');
+          } finally {
+            setIsLoading(false);
+          }
+        };
+
+        return (
+          <div className="min-h-screen bg-slate-50 text-slate-800 p-4 md:p-8">
+            <div className="max-w-4xl mx-auto space-y-6">
+
+              <div className="text-center space-y-2 mb-8">
+                <div className="inline-flex items-center justify-center p-3 bg-indigo-100 rounded-2xl mb-4 text-indigo-600 shadow-sm text-3xl">📖</div>
+                <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">Chunk &amp; Catch</h1>
+                <p className="text-slate-500">원서 속 숨은 의미를 캐치하고, 문맥 단위로 끊어 읽으세요.</p>
+              </div>
+
+              <div className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
+                <div className="flex border-b border-slate-100">
+                  <button onClick={() => setActiveTab('text')}
+                    className={'flex-1 flex items-center justify-center gap-2 py-4 font-medium transition-colors ' + (activeTab === 'text' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50/30' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50')}>
+                    ⌨️ 여러 문장 타이핑
+                  </button>
+                  <button onClick={() => setActiveTab('image')}
+                    className={'flex-1 flex items-center justify-center gap-2 py-4 font-medium transition-colors ' + (activeTab === 'image' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50/30' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50')}>
+                    📷 페이지 전체 업로드
+                  </button>
+                </div>
+
+                <div className="p-6 md:p-8 space-y-6">
+                  {activeTab === 'text' && (
+                    <div className="space-y-3">
+                      <label className="block text-sm font-semibold text-slate-700">해석이 어려운 영어 문장들 (여러 문장 가능)</label>
+                      <textarea
+                        className="w-full h-40 p-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all resize-none"
+                        placeholder="여러 문장을 한 번에 입력하셔도 됩니다. 예: I couldn't put up with his behavior anymore. So I decided to call off the meeting."
+                        value={textInput}
+                        onChange={(e) => setTextInput(e.target.value)} />
+                    </div>
+                  )}
+
+                  {activeTab === 'image' && (
+                    <div className="space-y-3">
+                      <label className="block text-sm font-semibold text-slate-700">원서 페이지 업로드</label>
+                      <div className="relative group border-2 border-dashed border-slate-300 rounded-2xl bg-slate-50 hover:bg-indigo-50/50 transition-colors">
+                        <input type="file" accept="image/*" onChange={handleImageUpload}
+                          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" />
+                        {imagePreview ? (
+                          <div className="p-4 flex flex-col items-center justify-center space-y-4">
+                            <img src={imagePreview} alt="Preview" className="max-h-64 rounded-lg shadow-sm" />
+                            <p className="text-sm text-indigo-600 font-medium">사진을 변경하려면 클릭, 파일 드롭 또는 <strong>Ctrl+V</strong></p>
+                          </div>
+                        ) : (
+                          <div className="flex flex-col items-center justify-center p-12 text-slate-500 space-y-3">
+                            <div className="text-4xl text-slate-400">⬆️</div>
+                            <p className="font-medium text-center">클릭하여 파일 선택, 드래그 앤 드롭,<br />또는 화면 캡처 후 <strong className="text-indigo-600">Ctrl+V (붙여넣기)</strong></p>
+                            <p className="text-xs text-slate-400">PNG, JPG 지원</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {error && (
+                    <div className="flex items-center gap-2 p-4 bg-red-50 text-red-700 rounded-xl text-sm">⚠️ {error}</div>
+                  )}
+
+                  <button onClick={analyzeContent} disabled={isLoading}
+                    className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-bold rounded-2xl shadow-sm hover:shadow-md transition-all flex items-center justify-center gap-2">
+                    {isLoading ? (<><span className="spin inline-block">⏳</span> 전체 문장 분석 중...</>) : (<>전체 분석하기 →</>)}
+                  </button>
+                </div>
+              </div>
+
+              {result && result.sentences && (
+                <div className="space-y-8">
+                  <div className="flex items-center gap-2 text-indigo-700 font-bold px-2">
+                    📋 <h2 className="text-xl">총 {result.sentences.length}개의 문장이 분석되었습니다.</h2>
+                  </div>
+
+                  {result.sentences.map((s, sIndex) => (
+                    <div key={sIndex} className="bg-white rounded-3xl shadow-md border border-slate-200 overflow-hidden">
+                      <div className="p-5 bg-slate-800 text-white flex gap-4 items-start relative">
+                        <div className="flex-shrink-0 bg-slate-700 text-slate-300 w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm">{sIndex + 1}</div>
+                        <p className="font-serif text-lg leading-relaxed mt-1 flex-1 pr-20">{s.original_sentence}</p>
+                        <div className="flex flex-col sm:flex-row gap-2 shrink-0 absolute top-5 right-5 sm:relative sm:top-0 sm:right-0">
+                          <button onClick={() => handleSpeak(s.original_sentence, 'en-US')}
+                            className="flex items-center gap-1.5 text-xs bg-slate-700 hover:bg-indigo-500 px-3 py-2 rounded-xl transition-colors text-slate-200 hover:text-white" title="미국 발음">🔊 🇺🇸 US</button>
+                          <button onClick={() => handleSpeak(s.original_sentence, 'en-GB')}
+                            className="flex items-center gap-1.5 text-xs bg-slate-700 hover:bg-emerald-500 px-3 py-2 rounded-xl transition-colors text-slate-200 hover:text-white" title="영국 발음">🔊 🇬🇧 UK</button>
+                        </div>
+                      </div>
+
+                      <div className="p-6 md:p-8 space-y-6">
+                        <div>
+                          <div className="flex items-center gap-2 mb-4 text-indigo-600 font-bold">✂️ 스마트 끊어 읽기</div>
+                          <div className="space-y-4">
+                            {(s.chunks || []).map((chunk, cIndex) => (
+                              <div key={cIndex} className="flex flex-col gap-1.5 pl-4 border-l-2 border-slate-100">
+                                <div className="flex flex-col md:flex-row md:items-baseline gap-2">
+                                  <span className="text-lg font-bold text-slate-800">{chunk.english}</span>
+                                  <span className="text-slate-500">({chunk.korean})</span>
+                                </div>
+                                {chunk.is_idiom && (
+                                  <div className="mt-2 mb-1 flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-sm">
+                                    💡 <div><strong className="block text-amber-700 mb-1">[핵심 구동사/이디엄]</strong>{chunk.idiom_explanation}</div>
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+
+                        {s.syntax && (s.syntax.structure || (s.syntax.points && s.syntax.points.length > 0)) && (
+                          <div>
+                            <div className="flex items-center gap-2 mb-3 text-sky-600 font-bold">🔗 구문 뜯어보기</div>
+                            {s.syntax.structure && (
+                              <div className="mb-3 p-3 bg-sky-50 border border-sky-200 rounded-xl text-sky-900 text-sm font-medium leading-relaxed">{s.syntax.structure}</div>
+                            )}
+                            {s.syntax.points && s.syntax.points.length > 0 && (
+                              <div className="space-y-2.5">
+                                {s.syntax.points.map((pt, pIndex) => (
+                                  <div key={pIndex} className="flex flex-col gap-0.5 pl-4 border-l-2 border-sky-100">
+                                    <span className="font-semibold text-sky-700 text-sm">{pt.label}</span>
+                                    <span className="text-slate-600 text-sm leading-relaxed">{pt.detail}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {s.vocabulary && s.vocabulary.length > 0 && (
+                          <div>
+                            <div className="flex items-center gap-2 mb-3 text-emerald-600 font-bold">🏷️ 핵심 단어 노트</div>
+                            <div className="flex flex-wrap gap-2">
+                              {s.vocabulary.map((v, vIndex) => (
+                                <div key={vIndex} className="inline-flex items-center gap-2 p-2 px-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-sm shadow-sm">
+                                  <strong className="text-emerald-700">{v.word}</strong>
+                                  <span className="text-emerald-300">|</span>
+                                  <span>{v.meaning}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        <hr className="border-slate-100" />
+
+                        <div>
+                          <div className="flex items-center gap-2 mb-3 text-indigo-600 font-bold">📖 최종 해석</div>
+                          <p className="text-slate-800 font-medium leading-relaxed bg-slate-50 p-4 rounded-2xl">{s.final_translation}</p>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+  </body>
+</html>
