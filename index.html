@@ -150,6 +150,10 @@
           }
         };
 
+        // 모델이 가끔 내용 없는 빈 문장 객체를 반환하므로 걸러냄
+        const sentences = (result && Array.isArray(result.sentences) ? result.sentences : [])
+          .filter((s) => s && s.original_sentence && s.original_sentence.trim());
+
         return (
           <div className="min-h-screen bg-slate-50 text-slate-800 p-4 md:p-8">
             <div className="max-w-4xl mx-auto space-y-6">
@@ -217,13 +221,13 @@
                 </div>
               </div>
 
-              {result && result.sentences && (
+              {sentences.length > 0 && (
                 <div className="space-y-8">
                   <div className="flex items-center gap-2 text-indigo-700 font-bold px-2">
-                    📋 <h2 className="text-xl">총 {result.sentences.length}개의 문장이 분석되었습니다.</h2>
+                    📋 <h2 className="text-xl">총 {sentences.length}개의 문장이 분석되었습니다.</h2>
                   </div>
 
-                  {result.sentences.map((s, sIndex) => (
+                  {sentences.map((s, sIndex) => (
                     <div key={sIndex} className="bg-white rounded-3xl shadow-md border border-slate-200 overflow-hidden">
                       <div className="p-5 bg-slate-800 text-white flex gap-4 items-start relative">
                         <div className="flex-shrink-0 bg-slate-700 text-slate-300 w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm">{sIndex + 1}</div>
