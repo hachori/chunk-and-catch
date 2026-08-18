@@ -145,7 +145,7 @@ function buildThinkingConfig() {
 }
 
 // GET /api/analyze → 키·모델 상태 진단. 비밀값은 노출하지 않는다.
-async function handleDiagnostics(res, legacy) {
+async function handleDiagnostics(res) {
   const apiKey = process.env.GEMINI_API_KEY;
   const model = resolveModel();
   const report = {
@@ -159,41 +159,6 @@ async function handleDiagnostics(res, legacy) {
   if (!apiKey) {
     report.error = 'GEMINI_API_KEY 환경변수가 설정되지 않았습니다.';
     return res.status(500).json(report);
-  }
-
-  // ?selftest=legacy → 예전 설정(구 모델 별칭 + thinkingBudget:0)을 그대로 한 번 호출해서
-  // 무엇이 고장의 원인이었는지 실제 Gemini 응답으로 확인한다.
-  if (legacy) {
-    const legacyModel = 'gemini-flash-lite-latest';
-    const probe = async (label, body, model) => {
-      const r = await fetch(
-        'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-          body: JSON.stringify(body),
-        }
-      );
-      const t = await r.text();
-      return { label, model, status: r.status, message: r.ok ? 'OK' : extractGeminiMessage(t) };
-    };
-    const base = { contents: [{ parts: [{ text: 'Say hi.' }] }] };
-    report.selftest = [
-      await probe('구 별칭 + thinkingBudget:0', {
-        ...base,
-        generationConfig: { thinkingConfig: { thinkingBudget: 0 } },
-      }, legacyModel),
-      await probe('구 별칭 + thinking 설정 없음', base, legacyModel),
-      await probe('현재 모델 + thinkingBudget:0', {
-        ...base,
-        generationConfig: { thinkingConfig: { thinkingBudget: 0 } },
-      }, model),
-      await probe('현재 모델 + thinkingLevel:minimal', {
-        ...base,
-        generationConfig: { thinkingConfig: { thinkingLevel: 'minimal' } },
-      }, model),
-    ];
-    return res.status(200).json(report);
   }
 
   try {
@@ -229,9 +194,7 @@ async function handleDiagnostics(res, legacy) {
 }
 
 module.exports = async function handler(req, res) {
-  if (req.method === 'GET') {
-    return handleDiagnostics(res, /[?&]selftest=legacy/.test(req.url || ''));
-  }
+  if (req.method === 'GET') return handleDiagnostics(res);
 
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'GET, POST');
