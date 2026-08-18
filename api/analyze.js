@@ -14,7 +14,7 @@ const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
 const DEFAULT_THINKING_LEVEL = 'minimal';
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 
-const systemInstruction = `당신은 원서를 읽는 한국인 학습자를 위한 영어 구문 분석 전문가입니다.
+const BOOK_INSTRUCTION = `당신은 원서를 읽는 한국인 학습자를 위한 영어 구문 분석 전문가입니다.
 
 1. 사용자가 입력한 텍스트 또는 이미지 내의 **'모든 완전한 문장들'**을 찾아내세요.
 2. 찾아낸 각 문장을 순서대로 분리하여 개별적으로 분석하세요.
@@ -26,6 +26,35 @@ const systemInstruction = `당신은 원서를 읽는 한국인 학습자를 위
    - points: 관계절, 분사구문, to부정사, 동명사, 가주어·진주어, 도치, 강조구문(it ~ that), 접속사로 이어진 절, 비교구문 등 학습자가 구조 파악에 어려움을 겪을 만한 핵심 문법 포인트를 골라, label(문법 명칭)과 detail(그 구조가 문장에서 어떻게 작동하는지에 대한 쉬운 한국어 설명)로 제공하세요. 특별한 구문이 없으면 빈 배열로 두세요.
 7. 각 청크별 직독직해와, 문장 전체의 자연스러운 한국어 최종 해석을 제공해야 합니다.
 결과는 반드시 여러 문장(sentences)을 포함하는 배열 형태로 반환해야 합니다.`;
+
+// 유튜브 자막 한 줄은 원서 문장과 다르다. 마침표가 없고, 문장이 아닐 수 있고, 축약과
+// 군말이 섞이고, 자동자막이면 오인식도 있다. 문어체 지시문을 그대로 쓰면 짧은 구어
+// 문장에서 모델이 chunks·syntax 를 통째로 빼먹는다.
+const SPEECH_INSTRUCTION = `당신은 영어 듣기/쉐도잉을 하는 한국인 학습자를 위한 영어 구문 분석 전문가입니다.
+입력은 영상 자막에서 뽑은 **말해진 영어 한 토막**입니다. 원서 문장이 아닙니다.
+
+1. 입력 전체를 **하나의 발화로 취급**해 분석하세요. 마침표가 없거나 문법적으로 완전한
+   문장이 아니어도 그대로 분석합니다. 명백히 두 문장 이상일 때만 나눠서 여러 개로 반환하세요.
+2. 입력이 (Laughter), (Applause), (Music) 같은 효과음 표기이거나 분석할 영어가 없으면
+   sentences 를 **빈 배열**로 반환하세요. 억지로 만들어내지 마세요.
+3. 구어의 특징을 그대로 다루세요 — 축약(I've, gonna, wanna, ain't), 음 줄임, 군말·담화표지
+   (you know, I mean, like, well, uh). 군말은 구문으로 따지지 말고 "말버릇/담화표지"로 짧게
+   설명하세요.
+4. **구동사·관용구·연어를 최우선으로 잡으세요.** 듣기에서 실제로 막히는 건 어려운 단어가
+   아니라 이런 덩어리 표현입니다. 글로 보면 쉬운 단어들의 조합이어도 반드시 잡아내세요.
+   (예: blown away, pull off, turn around, come up with, be into)
+5. vocabulary 에는 그 발화에서 학습자가 모를 만한 표현을 담되, word 에는 **표제어만**
+   적으세요. 설명·부연·괄호 주석을 word 에 넣지 마세요. 뜻은 meaning 에만 씁니다.
+   구동사는 원형으로 적으세요 (blown away → blow away).
+6. syntax.structure 는 발화의 뼈대를 한 줄로 요약합니다. S/V/O/C 로 표시하되, 생략된
+   성분이 있으면 "(생략된 주어) V(...) O(...)" 처럼 생략을 드러내세요. 문장 조각이면
+   조각이라고 밝히세요. points 에는 구조 파악에 걸릴 만한 포인트를 label/detail 로 담고,
+   특별한 게 없으면 빈 배열로 둡니다.
+7. 자동자막 오인식으로 보이는 부분이 있으면 detail 에서 짧게 짚어주세요.
+8. 각 청크의 직독직해와, 발화 전체의 자연스러운 한국어 해석을 반드시 제공하세요.
+
+sentences 를 빈 배열로 돌려주는 경우가 아니라면 chunks · vocabulary · syntax ·
+final_translation 을 **하나도 빠뜨리지 말고** 채우세요.`;
 
 const responseSchema = {
   type: 'OBJECT',
@@ -46,13 +75,20 @@ const responseSchema = {
                 is_idiom: { type: 'BOOLEAN' },
                 idiom_explanation: { type: 'STRING' },
               },
+              propertyOrdering: ['english', 'korean', 'is_idiom', 'idiom_explanation'],
+              required: ['english', 'korean', 'is_idiom'],
             },
           },
           vocabulary: {
             type: 'ARRAY',
             items: {
               type: 'OBJECT',
-              properties: { word: { type: 'STRING' }, meaning: { type: 'STRING' } },
+              properties: {
+                word: { type: 'STRING', description: '표제어만. 설명이나 괄호 주석을 넣지 말 것.' },
+                meaning: { type: 'STRING', description: '문맥에 맞는 한국어 뜻.' },
+              },
+              propertyOrdering: ['word', 'meaning'],
+              required: ['word', 'meaning'],
             },
           },
           syntax: {
@@ -64,15 +100,28 @@ const responseSchema = {
                 items: {
                   type: 'OBJECT',
                   properties: { label: { type: 'STRING' }, detail: { type: 'STRING' } },
+                  propertyOrdering: ['label', 'detail'],
+                  required: ['label', 'detail'],
                 },
               },
             },
+            propertyOrdering: ['structure', 'points'],
+            required: ['structure', 'points'],
           },
           final_translation: { type: 'STRING' },
         },
+        // required 를 안 걸면 모델이 필드를 통째로 생략한다. 짧은 구어 문장에서 chunks 와
+        // syntax 가 빠진 채로 오는 사고가 실제로 있었다.
+        propertyOrdering: [
+          'original_sentence', 'chunks', 'vocabulary', 'syntax', 'final_translation',
+        ],
+        required: [
+          'original_sentence', 'chunks', 'vocabulary', 'syntax', 'final_translation',
+        ],
       },
     },
   },
+  required: ['sentences'],
 };
 
 // Gemini 가 돌려준 에러 본문에서 사람이 읽을 메시지만 뽑아낸다.
@@ -144,6 +193,9 @@ function buildThinkingConfig() {
   return { thinkingLevel: level };
 }
 
+// POST 본문의 source 로 지시문이 갈린다:
+//   (없음) | 'book'  → 원서 문장 분석 (웹 UI)
+//   'speech'         → 자막·발화 분석 (쉐도잉 앱)
 // GET /api/analyze → 키·모델 상태 진단. 비밀값은 노출하지 않는다.
 async function handleDiagnostics(res) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -211,6 +263,8 @@ module.exports = async function handler(req, res) {
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
     const { mode, text, imageData, mimeType } = body;
+    // source: 'speech' 는 자막·듣기용. 안 보내면 기존대로 원서(문어체) 기준으로 분석한다.
+    const speech = body.source === 'speech';
 
     let contents;
     if (mode === 'image') {
@@ -238,7 +292,7 @@ module.exports = async function handler(req, res) {
     if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
 
     const payload = {
-      systemInstruction: { parts: [{ text: systemInstruction }] },
+      systemInstruction: { parts: [{ text: speech ? SPEECH_INSTRUCTION : BOOK_INSTRUCTION }] },
       contents,
       generationConfig,
     };
