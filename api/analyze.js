@@ -1,9 +1,17 @@
 // Vercel 서버리스 함수 (Node 런타임, CommonJS)
 // 브라우저가 아니라 서버에서만 실행 → Gemini API 키가 사용자에게 노출되지 않음.
-// 필요한 환경변수: GEMINI_API_KEY (Vercel 대시보드에서 설정)
-// (선택) GEMINI_MODEL — 기본 gemini-flash-lite-latest (빠르고 가벼운 최신 flash-lite 별칭)
+//
+// 환경변수:
+//   GEMINI_API_KEY         (필수) Google AI Studio 에서 발급한 키
+//   GEMINI_MODEL           (선택) 기본 gemini-3.5-flash-lite
+//   GEMINI_THINKING_LEVEL  (선택) minimal | low | medium | high | off(=파라미터 미전송). 기본 minimal
+//
+// ⚠️ 모델 ID 는 반드시 '버전이 박힌' 것을 쓸 것.
+//    gemini-flash-lite-latest 같은 -latest 별칭은 새 릴리스마다 가리키는 모델이 바뀌고,
+//    가리키던 모델이 은퇴하면 코드를 안 건드려도 어느 날 갑자기 404 로 죽는다.
 
-const DEFAULT_MODEL = 'gemini-flash-lite-latest';
+const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
+const DEFAULT_THINKING_LEVEL = 'minimal';
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 
 const systemInstruction = `당신은 원서를 읽는 한국인 학습자를 위한 영어 구문 분석 전문가입니다.
@@ -67,6 +75,42 @@ const responseSchema = {
   },
 };
 
+// Gemini 가 돌려준 에러 본문에서 사람이 읽을 메시지만 뽑아낸다.
+function extractGeminiMessage(bodyText) {
+  try {
+    const parsed = JSON.parse(bodyText);
+    if (parsed && parsed.error && parsed.error.message) return parsed.error.message;
+  } catch (_) {
+    /* JSON 이 아니면 원문 일부를 그대로 쓴다 */
+  }
+  return String(bodyText || '').slice(0, 300);
+}
+
+// 설정 문제(키/모델/권한)는 재시도해도 소용없으므로 즉시 사용자에게 원인을 알려준다.
+function describeConfigError(status, message, model) {
+  if (status === 400 && /API key not valid|API_KEY_INVALID/i.test(message)) {
+    return 'Gemini API 키가 유효하지 않습니다. Vercel 환경변수 GEMINI_API_KEY 를 새 키로 교체해 주세요.';
+  }
+  if (status === 403) {
+    return 'Gemini API 키에 권한이 없습니다. 키 제한(referrer/IP) 설정이나 Generative Language API 활성화 여부를 확인해 주세요.';
+  }
+  if (status === 404) {
+    return '모델 "' + model + '" 을(를) 찾을 수 없습니다. 은퇴한 모델일 수 있으니 GEMINI_MODEL 환경변수를 현재 사용 가능한 모델 ID 로 바꿔 주세요.';
+  }
+  if (status === 429) {
+    return 'Gemini API 사용량 한도를 초과했습니다. 잠시 후 다시 시도해 주세요.';
+  }
+  return null;
+}
+
+class GeminiHttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+    this.geminiMessage = message;
+  }
+}
+
 async function fetchGemini(url, options, retries = 4) {
   const delays = [1000, 2000, 4000, 8000];
   let lastErr;
@@ -74,23 +118,86 @@ async function fetchGemini(url, options, retries = 4) {
     try {
       const response = await fetch(url, options);
       if (response.ok) return await response.json();
-      if (!RETRYABLE.has(response.status)) {
-        const body = await response.text();
-        throw new Error('Gemini API 오류 (' + response.status + '): ' + body.slice(0, 300));
-      }
-      lastErr = new Error('Gemini API 일시 오류 (' + response.status + ')');
+
+      const bodyText = await response.text();
+      const message = extractGeminiMessage(bodyText);
+      if (!RETRYABLE.has(response.status)) throw new GeminiHttpError(response.status, message);
+      lastErr = new GeminiHttpError(response.status, message);
     } catch (err) {
+      if (err instanceof GeminiHttpError && !RETRYABLE.has(err.status)) throw err;
       lastErr = err;
-      if (err.message && err.message.indexOf('Gemini API 오류') === 0) throw err;
     }
     if (i < retries) await new Promise((r) => setTimeout(r, delays[i]));
   }
   throw lastErr || new Error('Gemini 요청에 실패했습니다.');
 }
 
+function resolveModel() {
+  return process.env.GEMINI_MODEL || DEFAULT_MODEL;
+}
+
+function buildThinkingConfig() {
+  const level = (process.env.GEMINI_THINKING_LEVEL || DEFAULT_THINKING_LEVEL).toLowerCase();
+  if (level === 'off') return null;
+  // Gemini 3 계열은 thinkingBudget 대신 thinkingLevel 을 쓴다.
+  // (둘을 같이 보내면 400. 예전 thinkingBudget: 0 에 해당하는 값이 'minimal')
+  return { thinkingLevel: level };
+}
+
+// GET /api/analyze → 키·모델 상태 진단. 비밀값은 노출하지 않는다.
+async function handleDiagnostics(res) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const model = resolveModel();
+  const report = {
+    ok: false,
+    apiKeyConfigured: Boolean(apiKey),
+    apiKeyLength: apiKey ? apiKey.length : 0,
+    model,
+    thinkingLevel: (process.env.GEMINI_THINKING_LEVEL || DEFAULT_THINKING_LEVEL).toLowerCase(),
+  };
+
+  if (!apiKey) {
+    report.error = 'GEMINI_API_KEY 환경변수가 설정되지 않았습니다.';
+    return res.status(500).json(report);
+  }
+
+  try {
+    const response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000',
+      { headers: { 'x-goog-api-key': apiKey } }
+    );
+    const bodyText = await response.text();
+
+    if (!response.ok) {
+      report.apiKeyValid = false;
+      report.geminiStatus = response.status;
+      report.error = extractGeminiMessage(bodyText);
+      return res.status(200).json(report);
+    }
+
+    report.apiKeyValid = true;
+    const listed = (JSON.parse(bodyText).models || []).map((m) =>
+      String(m.name || '').replace(/^models\//, '')
+    );
+    report.modelAvailable = listed.includes(model);
+    report.availableFlashModels = listed.filter((n) => n.indexOf('flash') !== -1).slice(0, 20);
+    report.ok = report.modelAvailable;
+    if (!report.modelAvailable) {
+      report.error =
+        '키는 유효하지만 모델 "' + model + '" 을(를) 쓸 수 없습니다. 위 목록의 모델 ID 로 GEMINI_MODEL 을 설정하세요.';
+    }
+    return res.status(200).json(report);
+  } catch (err) {
+    report.error = '진단 중 오류: ' + (err && err.message ? err.message : String(err));
+    return res.status(500).json(report);
+  }
+}
+
 module.exports = async function handler(req, res) {
+  if (req.method === 'GET') return handleDiagnostics(res);
+
   if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST');
+    res.setHeader('Allow', 'GET, POST');
     return res.status(405).json({ error: 'POST 요청만 지원합니다.' });
   }
 
@@ -99,7 +206,7 @@ module.exports = async function handler(req, res) {
     return res.status(500).json({ error: '서버에 GEMINI_API_KEY 환경변수가 설정되지 않았습니다.' });
   }
 
-  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+  const model = resolveModel();
 
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
@@ -122,39 +229,73 @@ module.exports = async function handler(req, res) {
       contents = [{ parts: [{ text }] }];
     }
 
+    const generationConfig = {
+      responseMimeType: 'application/json',
+      responseSchema,
+      maxOutputTokens: 16384,
+    };
+    const thinkingConfig = buildThinkingConfig();
+    if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
+
     const payload = {
       systemInstruction: { parts: [{ text: systemInstruction }] },
       contents,
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema,
-        maxOutputTokens: 8192,
-        thinkingConfig: { thinkingBudget: 0 },
-      },
+      generationConfig,
     };
 
+    // 키는 쿼리스트링(?key=)이 아니라 헤더로 보낸다 → URL·로그에 키가 남지 않는다.
     const url =
-      'https://generativelanguage.googleapis.com/v1beta/models/' +
-      model +
-      ':generateContent?key=' +
-      apiKey;
+      'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent';
 
     const data = await fetchGemini(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(payload),
     });
 
+    const candidate = data && data.candidates && data.candidates[0];
     const jsonText =
-      data && data.candidates && data.candidates[0] &&
-      data.candidates[0].content && data.candidates[0].content.parts &&
-      data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+      candidate && candidate.content && candidate.content.parts &&
+      candidate.content.parts[0] && candidate.content.parts[0].text;
 
-    if (!jsonText) return res.status(502).json({ error: '분석 결과를 받아오지 못했습니다.' });
+    if (!jsonText) {
+      const finishReason = candidate && candidate.finishReason;
+      const blockReason =
+        data && data.promptFeedback && data.promptFeedback.blockReason;
 
-    return res.status(200).json(JSON.parse(jsonText));
+      if (finishReason === 'MAX_TOKENS') {
+        return res.status(502).json({
+          error: '입력이 너무 길어 분석이 중간에 잘렸습니다. 문장 수를 줄여서 다시 시도해 주세요.',
+        });
+      }
+      if (blockReason || finishReason === 'SAFETY') {
+        return res.status(502).json({
+          error: '안전 필터에 걸려 분석 결과를 받지 못했습니다. 다른 문장으로 시도해 주세요.',
+        });
+      }
+      return res.status(502).json({
+        error: '분석 결과를 받아오지 못했습니다.',
+        detail: finishReason ? 'finishReason=' + finishReason : undefined,
+      });
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch (_) {
+      return res.status(502).json({ error: '분석 결과 형식이 올바르지 않습니다. 다시 시도해 주세요.' });
+    }
+
+    return res.status(200).json(parsed);
   } catch (err) {
-    console.error('[analyze] error:', err);
-    return res.status(500).json({ error: '분석 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.' });
+    const status = err instanceof GeminiHttpError ? err.status : null;
+    const geminiMessage = err instanceof GeminiHttpError ? err.geminiMessage : (err && err.message) || '';
+    console.error('[analyze] error:', status, geminiMessage);
+
+    const friendly = status ? describeConfigError(status, geminiMessage, model) : null;
+    return res.status(status && status < 500 ? status : 500).json({
+      error: friendly || '분석 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
+      detail: geminiMessage ? String(geminiMessage).slice(0, 300) : undefined,
+    });
   }
 };
