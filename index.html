@@ -9,6 +9,8 @@
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+    <script src="config.js"></script>
     <script>
       // JSX를 classic 런타임(React.createElement)으로 변환 — 브라우저 인라인 스크립트용
       Babel.registerPreset('classic-react', {
@@ -65,6 +67,114 @@
           img.src = src;
         });
 
+      // ── 단어장 저장 계층 ─────────────────────────────────────────
+      // config.js 가 비어 있거나 ?local=1 이면 localStorage 로 동작한다.
+      // 두 구현이 같은 인터페이스(list/add/remove/update)를 가지므로
+      // 화면 코드는 어느 쪽인지 몰라도 된다. (morning-meds 와 같은 패턴)
+      const cfg = window.APP_CONFIG || {};
+      const isLocalMode =
+        !cfg.SUPABASE_URL || !cfg.SUPABASE_ANON_KEY ||
+        new URLSearchParams(location.search).has('local');
+
+      const sb = isLocalMode
+        ? null
+        : window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY);
+
+      const LOCAL_KEY = 'chunk-and-catch-vocab';
+
+      const localVocabStore = {
+        _load() {
+          try {
+            const db = JSON.parse(localStorage.getItem(LOCAL_KEY)) || {};
+            return { items: db.items || [], seq: db.seq || 1 };
+          } catch (_) {
+            return { items: [], seq: 1 };
+          }
+        },
+        _save(db) {
+          try { localStorage.setItem(LOCAL_KEY, JSON.stringify(db)); } catch (_) {}
+        },
+        async list() {
+          return this._load().items.slice().sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+        },
+        async add(entry) {
+          const db = this._load();
+          const row = {
+            id: db.seq++,
+            known: false,
+            review_count: 0,
+            wrong_count: 0,
+            last_reviewed_at: null,
+            created_at: new Date().toISOString(),
+            ...entry,
+          };
+          db.items.push(row);
+          this._save(db);
+          return row;
+        },
+        async remove(id) {
+          const db = this._load();
+          db.items = db.items.filter((r) => r.id !== id);
+          this._save(db);
+        },
+        async update(id, patch) {
+          const db = this._load();
+          db.items = db.items.map((r) => (r.id === id ? { ...r, ...patch } : r));
+          this._save(db);
+        },
+      };
+
+      const supaVocabStore = {
+        async list() {
+          const { data, error } = await sb
+            .from('vocab_entries').select('*').order('created_at', { ascending: false });
+          if (error) throw error;
+          return data;
+        },
+        async add(entry) {
+          const { data, error } = await sb
+            .from('vocab_entries').insert(entry).select().single();
+          if (error) throw error;
+          return data;
+        },
+        async remove(id) {
+          const { error } = await sb.from('vocab_entries').delete().eq('id', id);
+          if (error) throw error;
+        },
+        async update(id, patch) {
+          const { error } = await sb.from('vocab_entries').update(patch).eq('id', id);
+          if (error) throw error;
+        },
+      };
+
+      const vocabStore = isLocalMode ? localVocabStore : supaVocabStore;
+
+      // 같은 단어인지 판정하는 키 (대소문자 무시)
+      const vocabKey = (type, term) => type + '|' + String(term).trim().toLowerCase();
+
+      function LoginForm({ onSubmit }) {
+        const [email, setEmail] = useState('');
+        const [password, setPassword] = useState('');
+        return (
+          <form className="space-y-3 max-w-sm mx-auto py-4"
+            onSubmit={(e) => { e.preventDefault(); onSubmit(email, password); }}>
+            <p className="text-sm text-slate-500 text-center">
+              단어장은 기기 간 동기화를 위해 로그인이 필요합니다.
+            </p>
+            <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
+              placeholder="이메일" autoComplete="username"
+              className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+            <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)}
+              placeholder="비밀번호" autoComplete="current-password"
+              className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+            <button type="submit"
+              className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl transition-colors">
+              로그인
+            </button>
+          </form>
+        );
+      }
+
       function App() {
         const [activeTab, setActiveTab] = useState('image');
         const [textInput, setTextInput] = useState('');
@@ -74,6 +184,21 @@
         const [isLoading, setIsLoading] = useState(false);
         const [result, setResult] = useState(null);
         const [error, setError] = useState('');
+
+        // ── 단어장 상태 ──
+        const [view, setView] = useState('analyze');       // analyze | vocab | cards
+        const [vocab, setVocab] = useState([]);
+        const [session, setSession] = useState(null);
+        const [vocabError, setVocabError] = useState('');
+        const [query, setQuery] = useState('');
+        const [hideMeaning, setHideMeaning] = useState(false);
+        const [revealed, setRevealed] = useState({});       // 뜻 가리기 중 개별 공개
+        const [onlyUnknown, setOnlyUnknown] = useState(false);
+        // ── 플래시카드 상태 ──
+        const [deck, setDeck] = useState([]);
+        const [cardIdx, setCardIdx] = useState(0);
+        const [flipped, setFlipped] = useState(false);
+        const [cardResults, setCardResults] = useState({}); // id -> true(앎)/false(모름)
 
         useEffect(() => {
           if ('speechSynthesis' in window) {
@@ -209,6 +334,129 @@
           setCrop((c) => (c && (c.x1 - c.x0 < 0.02 || c.y1 - c.y0 < 0.02) ? null : c));
         };
 
+        // ── 단어장 로직 ──────────────────────────────────────────────
+        const loggedIn = isLocalMode || !!session;
+
+        const savedMap = React.useMemo(() => {
+          const m = new Map();
+          for (const v of vocab) m.set(vocabKey(v.type, v.term), v.id);
+          return m;
+        }, [vocab]);
+
+        const reloadVocab = async () => {
+          try {
+            setVocab(await vocabStore.list());
+            setVocabError('');
+          } catch (e) {
+            console.error(e);
+            setVocabError('단어장을 불러오지 못했습니다.');
+          }
+        };
+
+        // 최초 진입: 로컬 모드면 바로, Supabase 모드면 기존 세션을 복원한 뒤 로드
+        useEffect(() => {
+          let alive = true;
+          (async () => {
+            if (isLocalMode) { await reloadVocab(); return; }
+            const { data } = await sb.auth.getSession();
+            if (!alive) return;
+            setSession(data.session);
+            if (data.session) await reloadVocab();
+            sb.auth.onAuthStateChange((_e, sess) => {
+              setSession(sess);
+              if (sess) reloadVocab(); else setVocab([]);
+            });
+          })();
+          return () => { alive = false; };
+        }, []);
+
+        // 단어/이디엄 저장 토글
+        const toggleSave = async (type, term, meaning, sourceSentence) => {
+          if (!loggedIn) {
+            setVocabError('단어장을 쓰려면 먼저 로그인해 주세요.');
+            setView('vocab');
+            return;
+          }
+          const key = vocabKey(type, term);
+          const existingId = savedMap.get(key);
+          try {
+            if (existingId !== undefined) {
+              setVocab((list) => list.filter((v) => v.id !== existingId));   // 낙관적 갱신
+              await vocabStore.remove(existingId);
+            } else {
+              const row = await vocabStore.add({
+                type,
+                term: String(term).trim(),
+                meaning: String(meaning || '').trim(),
+                source_sentence: sourceSentence || null,
+              });
+              setVocab((list) => [row, ...list]);
+            }
+            setVocabError('');
+          } catch (e) {
+            console.error(e);
+            setVocabError('저장에 실패했습니다. 잠시 후 다시 시도해 주세요.');
+            reloadVocab();
+          }
+        };
+
+        const removeEntry = async (id) => {
+          setVocab((list) => list.filter((v) => v.id !== id));
+          try { await vocabStore.remove(id); } catch (e) { console.error(e); reloadVocab(); }
+        };
+
+        const handleLogin = async (email, password) => {
+          const { error: err } = await sb.auth.signInWithPassword({ email, password });
+          if (err) { setVocabError('로그인에 실패했습니다. 이메일/비밀번호를 확인해 주세요.'); return; }
+          setVocabError('');
+        };
+
+        const handleLogout = async () => { await sb.auth.signOut(); setVocab([]); };
+
+        // 검색 + 필터가 적용된 목록
+        const visibleVocab = vocab.filter((v) => {
+          if (onlyUnknown && v.known) return false;
+          const q = query.trim().toLowerCase();
+          if (!q) return true;
+          return (v.term + ' ' + v.meaning).toLowerCase().includes(q);
+        });
+
+        // ── 플래시카드 ──
+        const shuffle = (arr) => {
+          const a = arr.slice();
+          for (let i = a.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [a[i], a[j]] = [a[j], a[i]];
+          }
+          return a;
+        };
+
+        const startCards = (items) => {
+          if (!items.length) return;
+          setDeck(shuffle(items));
+          setCardIdx(0);
+          setFlipped(false);
+          setCardResults({});
+          setView('cards');
+        };
+
+        // 카드 채점: 저장이 실패해도 학습 흐름은 멈추지 않는다
+        const gradeCard = async (entry, isKnown) => {
+          setCardResults((r) => ({ ...r, [entry.id]: isKnown }));
+          setCardIdx((i) => i + 1);
+          setFlipped(false);
+
+          const patch = {
+            known: isKnown,
+            review_count: (entry.review_count || 0) + 1,
+            wrong_count: (entry.wrong_count || 0) + (isKnown ? 0 : 1),
+            last_reviewed_at: new Date().toISOString(),
+          };
+          setVocab((list) => list.map((v) => (v.id === entry.id ? { ...v, ...patch } : v)));
+          try { await vocabStore.update(entry.id, patch); }
+          catch (e) { console.error(e); setVocabError('학습 기록을 저장하지 못했습니다.'); }
+        };
+
         const analyzeContent = async () => {
           setError('');
           setResult(null);
@@ -246,6 +494,11 @@
         const sentences = (result && Array.isArray(result.sentences) ? result.sentences : [])
           .filter((s) => s && s.original_sentence && s.original_sentence.trim());
 
+        const cardDone = deck.length > 0 && cardIdx >= deck.length;
+        const cardKnownCount = Object.values(cardResults).filter(Boolean).length;
+        const cardWrongList = deck.filter((d) => cardResults[d.id] === false);
+        const currentCard = deck[cardIdx];
+
         return (
           <div className="min-h-screen bg-slate-50 text-slate-800 p-4 md:p-8">
             <div className="max-w-4xl mx-auto space-y-6">
@@ -254,8 +507,16 @@
                 <div className="inline-flex items-center justify-center p-3 bg-indigo-100 rounded-2xl mb-4 text-indigo-600 shadow-sm text-3xl">📖</div>
                 <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">Chunk &amp; Catch</h1>
                 <p className="text-slate-500">원서 속 숨은 의미를 캐치하고, 문맥 단위로 끊어 읽으세요.</p>
+                <div className="pt-2">
+                  <button onClick={() => setView('vocab')}
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-xl text-slate-700 font-medium shadow-sm hover:border-emerald-300 hover:text-emerald-700 transition-colors">
+                    📒 단어장
+                    <span className="inline-flex items-center justify-center min-w-6 h-6 px-1.5 bg-emerald-100 text-emerald-700 rounded-full text-xs font-bold">{vocab.length}</span>
+                  </button>
+                </div>
               </div>
 
+              {view === 'analyze' && (<>
               <div className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
                 <div className="flex border-b border-slate-100">
                   <button onClick={() => setActiveTab('image')}
@@ -392,7 +653,25 @@
                                 </div>
                                 {chunk.is_idiom && (
                                   <div className="mt-2 mb-1 flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-sm">
-                                    💡 <div><strong className="block text-amber-700 mb-1">[핵심 구동사/이디엄]</strong>{chunk.idiom_explanation}</div>
+                                    💡
+                                    <div className="flex-1">
+                                      <strong className="block text-amber-700 mb-1">[핵심 구동사/이디엄]</strong>
+                                      {chunk.idiom_explanation}
+                                      <div className="mt-2">
+                                        {(() => {
+                                          const saved = savedMap.has(vocabKey('idiom', chunk.english));
+                                          return (
+                                            <button type="button"
+                                              onClick={() => toggleSave('idiom', chunk.english, chunk.idiom_explanation, s.original_sentence)}
+                                              className={'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ' + (saved
+                                                ? 'bg-amber-600 border-amber-600 text-white'
+                                                : 'bg-white border-amber-300 text-amber-700 hover:bg-amber-100')}>
+                                              {saved ? '✓ 단어장에 있음' : '＋ 단어장에 담기'}
+                                            </button>
+                                          );
+                                        })()}
+                                      </div>
+                                    </div>
                                   </div>
                                 )}
                               </div>
@@ -423,13 +702,22 @@
                           <div>
                             <div className="flex items-center gap-2 mb-3 text-emerald-600 font-bold">🏷️ 핵심 단어 노트</div>
                             <div className="flex flex-wrap gap-2">
-                              {s.vocabulary.map((v, vIndex) => (
-                                <div key={vIndex} className="inline-flex items-center gap-2 p-2 px-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-sm shadow-sm">
-                                  <strong className="text-emerald-700">{v.word}</strong>
-                                  <span className="text-emerald-300">|</span>
-                                  <span>{v.meaning}</span>
-                                </div>
-                              ))}
+                              {s.vocabulary.map((v, vIndex) => {
+                                const saved = savedMap.has(vocabKey('word', v.word));
+                                return (
+                                  <button key={vIndex} type="button"
+                                    onClick={() => toggleSave('word', v.word, v.meaning, s.original_sentence)}
+                                    title={saved ? '단어장에서 빼기' : '단어장에 담기'}
+                                    className={'inline-flex items-center gap-2 p-2 px-3 rounded-xl text-sm shadow-sm border transition-colors ' + (saved
+                                      ? 'bg-emerald-600 border-emerald-600 text-white'
+                                      : 'bg-emerald-50 border-emerald-200 text-emerald-900 hover:bg-emerald-100')}>
+                                    <span className={'font-bold ' + (saved ? 'text-white' : 'text-emerald-700')}>{v.word}</span>
+                                    <span className={saved ? 'text-emerald-200' : 'text-emerald-300'}>|</span>
+                                    <span>{v.meaning}</span>
+                                    <span className={'ml-0.5 font-bold ' + (saved ? 'text-white' : 'text-emerald-400')}>{saved ? '✓' : '＋'}</span>
+                                  </button>
+                                );
+                              })}
                             </div>
                           </div>
                         )}
@@ -445,6 +733,168 @@
                   ))}
                 </div>
               )}
+              </>)}
+
+              {view === 'vocab' && (
+                <div className="bg-white rounded-3xl shadow-sm border border-slate-200 p-6 md:p-8 space-y-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <button onClick={() => setView('analyze')}
+                      className="text-slate-500 hover:text-slate-800 font-medium">← 돌아가기</button>
+                    {!isLocalMode && session && (
+                      <button onClick={handleLogout} className="text-sm text-slate-400 hover:text-slate-600">로그아웃</button>
+                    )}
+                  </div>
+
+                  <h2 className="text-2xl font-extrabold text-slate-900">📒 내 단어장</h2>
+
+                  {vocabError && (
+                    <div className="p-3 bg-red-50 text-red-700 rounded-xl text-sm">⚠️ {vocabError}</div>
+                  )}
+
+                  {!loggedIn ? (
+                    <LoginForm onSubmit={handleLogin} />
+                  ) : vocab.length === 0 ? (
+                    <div className="p-10 text-center text-slate-400 leading-relaxed">
+                      아직 담은 단어가 없습니다.<br />
+                      분석 결과의 <strong className="text-emerald-600">🏷️ 핵심 단어</strong>를 터치하면 여기에 쌓입니다.
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      <input value={query} onChange={(e) => setQuery(e.target.value)}
+                        placeholder="단어 또는 뜻으로 검색"
+                        className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button onClick={() => { setHideMeaning(!hideMeaning); setRevealed({}); }}
+                          className={'px-3 py-2 rounded-xl text-sm font-medium border transition-colors ' + (hideMeaning
+                            ? 'bg-indigo-600 border-indigo-600 text-white'
+                            : 'bg-white border-slate-300 text-slate-600 hover:bg-slate-50')}>
+                          {hideMeaning ? '🙈 뜻 가리는 중' : '👁️ 뜻 가리기'}
+                        </button>
+                        <button onClick={() => setOnlyUnknown(!onlyUnknown)}
+                          className={'px-3 py-2 rounded-xl text-sm font-medium border transition-colors ' + (onlyUnknown
+                            ? 'bg-amber-500 border-amber-500 text-white'
+                            : 'bg-white border-slate-300 text-slate-600 hover:bg-slate-50')}>
+                          {onlyUnknown ? '못 외운 것만' : '전체 보기'}
+                        </button>
+                        <button onClick={() => startCards(visibleVocab)} disabled={!visibleVocab.length}
+                          className="px-4 py-2 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white transition-colors">
+                          🎴 카드 학습 ({visibleVocab.length})
+                        </button>
+                      </div>
+
+                      <div className="space-y-2">
+                        {visibleVocab.map((v) => {
+                          const open = !hideMeaning || revealed[v.id];
+                          return (
+                            <div key={v.id} className="flex items-start gap-3 p-3 border border-slate-200 rounded-xl hover:border-slate-300 transition-colors">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <strong className="text-slate-900">{v.term}</strong>
+                                  {v.type === 'idiom' && (
+                                    <span className="text-[11px] px-1.5 py-0.5 bg-amber-100 text-amber-700 rounded">구동사</span>
+                                  )}
+                                  {v.known && (
+                                    <span className="text-[11px] px-1.5 py-0.5 bg-emerald-100 text-emerald-700 rounded">외움</span>
+                                  )}
+                                </div>
+                                <div onClick={() => setRevealed((r) => ({ ...r, [v.id]: true }))}
+                                  className={'mt-1 text-sm ' + (open ? 'text-slate-600' : 'bg-slate-200 text-transparent rounded cursor-pointer select-none')}>
+                                  {open ? v.meaning : '뜻 보기'}
+                                </div>
+                                {v.source_sentence && (
+                                  <p className="mt-1.5 text-xs text-slate-400 italic truncate">{v.source_sentence}</p>
+                                )}
+                              </div>
+                              <button onClick={() => removeEntry(v.id)}
+                                className="shrink-0 text-slate-300 hover:text-red-500 transition-colors px-1" title="삭제">✕</button>
+                            </div>
+                          );
+                        })}
+                        {!visibleVocab.length && (
+                          <p className="p-6 text-center text-slate-400 text-sm">조건에 맞는 단어가 없습니다.</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {view === 'cards' && (
+                <div className="bg-white rounded-3xl shadow-sm border border-slate-200 p-6 md:p-8 space-y-5">
+                  {!cardDone && currentCard ? (
+                    <>
+                      <div className="flex items-center justify-between gap-3">
+                        <button onClick={() => setView('vocab')}
+                          className="text-slate-500 hover:text-slate-800 font-medium">← 단어장</button>
+                        <div className="flex items-center gap-3">
+                          <button onClick={() => handleSpeak(currentCard.term, 'en-US')}
+                            className="text-slate-400 hover:text-indigo-600 transition-colors" title="발음 듣기">🔊</button>
+                          <span className="text-sm text-slate-400 font-medium">{cardIdx + 1} / {deck.length}</span>
+                        </div>
+                      </div>
+
+                      <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                        <div className="h-full bg-emerald-500 transition-all"
+                          style={{ width: (cardIdx / deck.length) * 100 + '%' }} />
+                      </div>
+
+                      <div onClick={() => setFlipped((f) => !f)}
+                        className="min-h-56 flex flex-col items-center justify-center text-center gap-3 p-6 bg-slate-50 border-2 border-slate-200 rounded-2xl cursor-pointer select-none hover:border-indigo-300 transition-colors">
+                        {!flipped ? (
+                          <>
+                            <div className="text-3xl font-extrabold text-slate-900 break-words">{currentCard.term}</div>
+                            <div className="text-sm text-slate-400">탭하면 뜻이 보입니다</div>
+                          </>
+                        ) : (
+                          <>
+                            <div className="text-2xl font-bold text-indigo-700 break-words">{currentCard.meaning}</div>
+                            {currentCard.source_sentence && (
+                              <p className="text-sm text-slate-500 italic leading-relaxed">{currentCard.source_sentence}</p>
+                            )}
+                          </>
+                        )}
+                      </div>
+
+                      {flipped && (
+                        <div className="grid grid-cols-2 gap-3">
+                          <button onClick={() => gradeCard(currentCard, false)}
+                            className="py-4 rounded-2xl font-bold bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 transition-colors">
+                            ❌ 몰라요
+                          </button>
+                          <button onClick={() => gradeCard(currentCard, true)}
+                            className="py-4 rounded-2xl font-bold bg-emerald-600 text-white hover:bg-emerald-700 transition-colors">
+                            ✅ 알아요
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="text-center space-y-5 py-6">
+                      <div className="text-5xl">🎉</div>
+                      <h2 className="text-2xl font-extrabold text-slate-900">학습 완료!</h2>
+                      <p className="text-slate-600">
+                        총 <strong>{deck.length}</strong>장 중{' '}
+                        <strong className="text-emerald-600">{cardKnownCount}개</strong>를 외웠고,{' '}
+                        <strong className="text-red-500">{cardWrongList.length}개</strong>가 남았습니다.
+                      </p>
+                      <div className="flex flex-col sm:flex-row gap-3 justify-center">
+                        {cardWrongList.length > 0 && (
+                          <button onClick={() => startCards(cardWrongList)}
+                            className="px-6 py-3 rounded-2xl font-bold bg-indigo-600 text-white hover:bg-indigo-700 transition-colors">
+                            모르는 것만 다시 ({cardWrongList.length})
+                          </button>
+                        )}
+                        <button onClick={() => setView('vocab')}
+                          className="px-6 py-3 rounded-2xl font-bold border border-slate-300 text-slate-600 hover:bg-slate-50 transition-colors">
+                          단어장으로
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
             </div>
           </div>
         );
