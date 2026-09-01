@@ -147,6 +147,10 @@
         const [newTerm, setNewTerm] = useState('');
         const [newMeaning, setNewMeaning] = useState('');
 
+        const [dictQuery, setDictQuery] = useState('');
+        const [dictResult, setDictResult] = useState(null);
+        const [dictLoading, setDictLoading] = useState(false);
+
         const [deck, setDeck] = useState([]);
         const [cardIdx, setCardIdx] = useState(0);
         const [flipped, setFlipped] = useState(false);
@@ -216,6 +220,45 @@
             const row = await store.add({ type: 'word', term, meaning, source_sentence: null });
             setVocab((l) => [row, ...l]);
             setNewTerm(''); setNewMeaning(''); setErr('');
+            setNotice('“' + term + '” 을(를) 담았습니다.');
+            setTimeout(() => setNotice(''), 2500);
+          } catch (e2) {
+            console.error(e2);
+            setErr(e2 && e2.code === '23505'
+              ? '이미 단어장에 있는 단어입니다.'
+              : '저장하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+          }
+        };
+
+        const lookup = async (e) => {
+          if (e) e.preventDefault();
+          const word = dictQuery.trim();
+          if (!word) return setErr('찾을 단어를 입력해 주세요.');
+          setDictLoading(true); setErr(''); setDictResult(null);
+          try {
+            const res = await fetch('/api/define', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ word }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error((data && data.error) || ('요청 실패 (' + res.status + ')'));
+            setDictResult(data);
+          } catch (e2) {
+            console.error(e2);
+            setErr(e2.message || '단어를 찾지 못했습니다.');
+          } finally {
+            setDictLoading(false);
+          }
+        };
+
+        // 사전에서 찾은 단어를 바로 단어장에 담기
+        const saveFromDict = async (term, meaning, example) => {
+          try {
+            const row = await store.add({
+              type: 'word', term, meaning, source_sentence: example || null,
+            });
+            setVocab((l) => [row, ...l]);
             setNotice('“' + term + '” 을(를) 담았습니다.');
             setTimeout(() => setNotice(''), 2500);
           } catch (e2) {
@@ -345,6 +388,7 @@
                     <Chip active={view === 'list'} onClick={() => setView('list')}>📋 목록</Chip>
                     <Chip active={view === 'cards'} onClick={() => startCards(visible)}>🎴 카드 학습</Chip>
                     <Chip active={view === 'stats'} onClick={() => setView('stats')}>📊 통계</Chip>
+                    <Chip active={view === 'dict'} onClick={() => setView('dict')}>📖 사전</Chip>
                   </div>
 
                   {err && <div className="p-3 bg-red-50 text-red-700 rounded-xl text-sm">⚠️ {err}</div>}
@@ -585,6 +629,112 @@
                           ? new Date(stats.lastReviewed).toLocaleString('ko-KR')
                           : '아직 없음'}
                       </p>
+                    </div>
+                  )}
+
+                  {view === 'dict' && (
+                    <div className="bg-white rounded-3xl shadow-sm border border-slate-200 p-5 md:p-6 space-y-4">
+                      <div className="flex items-center justify-between">
+                        <h2 className="text-xl font-extrabold text-slate-900">📖 영어사전</h2>
+                        <button onClick={() => setView('list')}
+                          className="text-slate-500 hover:text-slate-800 text-sm font-medium">← 목록</button>
+                      </div>
+
+                      <form onSubmit={lookup} className="flex gap-2">
+                        <input value={dictQuery} onChange={(e) => setDictQuery(e.target.value)}
+                          placeholder="영어 단어나 표현 (예: ponder, come across)"
+                          autoCapitalize="none" autoCorrect="off"
+                          className="flex-1 min-w-0 p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+                        <button type="submit" disabled={dictLoading}
+                          className="px-5 py-3 rounded-xl font-bold bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white transition-colors shrink-0">
+                          {dictLoading ? <span className="spin inline-block">⏳</span> : '찾기'}
+                        </button>
+                      </form>
+
+                      {dictLoading && (
+                        <p className="p-8 text-center text-slate-400 text-sm">
+                          <span className="spin inline-block mr-1">⏳</span> 뜻을 찾는 중…
+                        </p>
+                      )}
+
+                      {dictResult && !dictLoading && (
+                        <div className="space-y-4">
+                          <div className="flex items-center gap-3 flex-wrap pb-3 border-b border-slate-100">
+                            <h3 className="text-2xl font-extrabold text-slate-900">{dictResult.word}</h3>
+                            {dictResult.phonetic && (
+                              <span className="text-slate-400 font-mono text-sm">{dictResult.phonetic}</span>
+                            )}
+                            <button onClick={() => speak(dictResult.word)}
+                              className="text-slate-400 hover:text-emerald-600 transition-colors" title="발음 듣기">🔊</button>
+                          </div>
+
+                          {dictResult.summary && (
+                            <p className="p-3 bg-emerald-50 text-emerald-900 rounded-xl font-medium">
+                              {dictResult.summary}
+                            </p>
+                          )}
+
+                          {(dictResult.senses || []).map((sn, i) => {
+                            const saved = vocab.some(
+                              (v) => v.type === 'word' &&
+                                v.term.toLowerCase() === String(dictResult.word).toLowerCase()
+                            );
+                            return (
+                              <div key={i} className="p-4 border border-slate-200 rounded-2xl space-y-2">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-[11px] px-2 py-0.5 bg-slate-100 text-slate-600 rounded font-medium">
+                                    {sn.part_of_speech}
+                                  </span>
+                                  <strong className="text-slate-900">{sn.meaning_ko}</strong>
+                                </div>
+                                {sn.example_en && (
+                                  <div className="pl-3 border-l-2 border-slate-100 space-y-0.5">
+                                    <div className="flex items-start gap-2">
+                                      <p className="text-slate-700 text-sm flex-1">{sn.example_en}</p>
+                                      <button onClick={() => speak(sn.example_en)}
+                                        className="text-slate-300 hover:text-emerald-600 transition-colors shrink-0" title="예문 듣기">🔊</button>
+                                    </div>
+                                    {sn.example_ko && <p className="text-slate-500 text-sm">{sn.example_ko}</p>}
+                                  </div>
+                                )}
+                                <button
+                                  onClick={() => saveFromDict(dictResult.word, sn.meaning_ko, sn.example_en)}
+                                  disabled={saved}
+                                  className={'w-full mt-1 py-2 rounded-xl text-sm font-medium border transition-colors ' + (saved
+                                    ? 'bg-slate-50 border-slate-200 text-slate-400'
+                                    : 'bg-white border-emerald-300 text-emerald-700 hover:bg-emerald-50')}>
+                                  {saved ? '✓ 이미 단어장에 있음' : '＋ 이 뜻으로 단어장에 담기'}
+                                </button>
+                              </div>
+                            );
+                          })}
+
+                          {(dictResult.synonyms || []).length > 0 && (
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm text-slate-500">비슷한 말</span>
+                              {dictResult.synonyms.map((w, i) => (
+                                <button key={i} onClick={() => { setDictQuery(w); setDictResult(null); }}
+                                  className="px-2.5 py-1 bg-slate-100 hover:bg-emerald-100 hover:text-emerald-700 text-slate-600 rounded-lg text-sm transition-colors">
+                                  {w}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          {dictResult.notes && (
+                            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-sm leading-relaxed">
+                              💡 {dictResult.notes}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {!dictResult && !dictLoading && (
+                        <p className="p-8 text-center text-slate-400 text-sm leading-relaxed">
+                          찾고 싶은 영어 단어를 입력해 보세요.<br />
+                          뜻과 예문을 확인하고 바로 단어장에 담을 수 있습니다.
+                        </p>
+                      )}
                     </div>
                   )}
 
