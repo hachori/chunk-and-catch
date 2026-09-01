@@ -669,8 +669,10 @@
                           </div>
 
                           {dictResult.summary && (
-                            <p className="p-3 bg-emerald-50 text-emerald-900 rounded-xl font-medium">
-                              {dictResult.summary}
+                            <p className={'p-3 rounded-xl font-medium ' + ((dictResult.senses || []).length
+                              ? 'bg-emerald-50 text-emerald-900'
+                              : 'bg-amber-50 text-amber-800')}>
+                              {(dictResult.senses || []).length ? '' : '🔍 '}{dictResult.summary}
                             </p>
                           )}
 

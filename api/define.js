@@ -10,7 +10,8 @@ const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 const systemInstruction = `당신은 한국인 영어 학습자를 위한 영한사전입니다.
 사용자가 입력한 영어 단어나 표현을 사전 항목처럼 정리하세요.
 
-1. phonetic: 미국식 발음기호를 IPA 로 적으세요 (예: /ˈpɒndər/). 모르면 빈 문자열.
+1. phonetic: 미국식 발음기호를 IPA 로 반드시 적으세요 (예: /ˈpɑːndər/).
+   구동사처럼 발음기호를 붙이기 어려우면 빈 문자열로 두세요.
 2. summary: 가장 핵심적인 뜻을 한국어 한 줄로 요약하세요.
 3. senses: 품사별 주요 뜻을 최대 4개까지. 각 항목은
    - part_of_speech: 한국어 품사명 (명사, 동사, 형용사, 부사, 구동사, 관용구 등)
@@ -46,7 +47,9 @@ const responseSchema = {
     synonyms: { type: 'ARRAY', items: { type: 'STRING' } },
     notes: { type: 'STRING' },
   },
-  required: ['word', 'summary', 'senses'],
+  // phonetic/synonyms/notes 도 required 로 둬야 모델이 생략하지 않는다.
+  // 값이 없을 땐 빈 문자열/빈 배열을 넣도록 systemInstruction 에서 지시한다.
+  required: ['word', 'phonetic', 'summary', 'senses', 'synonyms', 'notes'],
 };
 
 function extractGeminiMessage(bodyText) {
