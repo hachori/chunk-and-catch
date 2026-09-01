@@ -417,7 +417,12 @@
           if (mode === 'signup') {
             const { data, error: err } = await sb.auth.signUp({ email, password });
             if (err) {
-              setVocabError('계정을 만들지 못했습니다: ' + err.message);
+              // 이 앱은 본인 계정만 쓰므로 신규 가입을 막아 두었다
+              setVocabError(
+                err.message && err.message.indexOf('Signups not allowed') !== -1
+                  ? '이 단어장은 신규 가입을 받지 않습니다. 기존 계정으로 로그인해 주세요.'
+                  : '계정을 만들지 못했습니다: ' + err.message
+              );
               return;
             }
             // 이메일 확인이 켜져 있으면 세션 없이 확인 메일이 발송된다
