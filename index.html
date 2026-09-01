@@ -54,7 +54,7 @@
         });
 
       function App() {
-        const [activeTab, setActiveTab] = useState('text');
+        const [activeTab, setActiveTab] = useState('image');
         const [textInput, setTextInput] = useState('');
         const [imagePreview, setImagePreview] = useState(null);
         const [base64Image, setBase64Image] = useState(null);
@@ -166,28 +166,17 @@
 
               <div className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
                 <div className="flex border-b border-slate-100">
-                  <button onClick={() => setActiveTab('text')}
-                    className={'flex-1 flex items-center justify-center gap-2 py-4 font-medium transition-colors ' + (activeTab === 'text' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50/30' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50')}>
-                    ⌨️ 여러 문장 타이핑
-                  </button>
                   <button onClick={() => setActiveTab('image')}
                     className={'flex-1 flex items-center justify-center gap-2 py-4 font-medium transition-colors ' + (activeTab === 'image' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50/30' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50')}>
                     📷 페이지 전체 업로드
                   </button>
+                  <button onClick={() => setActiveTab('text')}
+                    className={'flex-1 flex items-center justify-center gap-2 py-4 font-medium transition-colors ' + (activeTab === 'text' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50/30' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50')}>
+                    ⌨️ 여러 문장 타이핑
+                  </button>
                 </div>
 
                 <div className="p-6 md:p-8 space-y-6">
-                  {activeTab === 'text' && (
-                    <div className="space-y-3">
-                      <label className="block text-sm font-semibold text-slate-700">해석이 어려운 영어 문장들 (여러 문장 가능)</label>
-                      <textarea
-                        className="w-full h-40 p-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all resize-none"
-                        placeholder="여러 문장을 한 번에 입력하셔도 됩니다. 예: I couldn't put up with his behavior anymore. So I decided to call off the meeting."
-                        value={textInput}
-                        onChange={(e) => setTextInput(e.target.value)} />
-                    </div>
-                  )}
-
                   {activeTab === 'image' && (
                     <div className="space-y-3">
                       <label className="block text-sm font-semibold text-slate-700">원서 페이지 업로드</label>
@@ -207,6 +196,17 @@
                           </div>
                         )}
                       </div>
+                    </div>
+                  )}
+
+                  {activeTab === 'text' && (
+                    <div className="space-y-3">
+                      <label className="block text-sm font-semibold text-slate-700">해석이 어려운 영어 문장들 (여러 문장 가능)</label>
+                      <textarea
+                        className="w-full h-40 p-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all resize-none"
+                        placeholder="여러 문장을 한 번에 입력하셔도 됩니다. 예: I couldn't put up with his behavior anymore. So I decided to call off the meeting."
+                        value={textInput}
+                        onChange={(e) => setTextInput(e.target.value)} />
                     </div>
                   )}
 
