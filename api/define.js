@@ -4,7 +4,7 @@
 // ⚠️ 모델 ID 는 반드시 버전이 박힌 것을 쓸 것. -latest 별칭은 어느 날 갑자기 죽는다.
 
 const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
-const DEFAULT_THINKING_LEVEL = 'minimal';
+const DEFAULT_THINKING_LEVEL = 'low';   // 단어 1개짜리 요청이라 조금 더 생각하게 해도 부담이 없다
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 
 const systemInstruction = `당신은 한국인 영어 학습자를 위한 영한사전입니다.
@@ -21,6 +21,9 @@ const systemInstruction = `당신은 한국인 영어 학습자를 위한 영한
 4. synonyms: 비슷한 뜻의 영어 단어를 최대 5개.
 5. notes: 뉘앙스, 자주 쓰이는 연어(collocation), 혼동하기 쉬운 단어와의 차이 등
    학습자가 알아두면 좋은 점을 2~3문장의 한국어로. 특별한 게 없으면 빈 문자열.
+
+모든 한국어는 조사와 어미를 빠뜨리지 말고, 사전에 그대로 실려도 될 만큼
+자연스럽고 완결된 표현으로 쓰세요. (예: "마 내키지 않는" ❌ → "마음이 내키지 않는" ⭕)
 
 입력이 영어 단어나 표현이 아니거나 뜻을 알 수 없으면
 summary 에 "찾을 수 없는 단어입니다." 라고 쓰고 senses 는 빈 배열로 두세요.`;
