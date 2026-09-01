@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+    <meta name="theme-color" content="#059669" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="단어장" />
+    <title>내 단어장 — Chunk &amp; Catch</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+    <script src="config.js"></script>
+    <script>
+      Babel.registerPreset('classic-react', {
+        presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]],
+      });
+    </script>
+    <style>
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .spin { animation: spin 1s linear infinite; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="classic-react">
+      const { useState, useEffect, useMemo, useRef } = React;
+
+      // 저장소는 chunk-and-catch(index.html)와 '같은' vocab_entries 테이블을 본다.
+      // 스키마의 단일 기준은 setup.sql.
+      const cfg = window.APP_CONFIG || {};
+      const isLocalMode =
+        !cfg.SUPABASE_URL || !cfg.SUPABASE_ANON_KEY ||
+        new URLSearchParams(location.search).has('local');
+
+      const sb = isLocalMode
+        ? null
+        : window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY);
+
+      const LOCAL_KEY = 'chunk-and-catch-vocab';
+
+      const localVocabStore = {
+        _load() {
+          try {
+            const db = JSON.parse(localStorage.getItem(LOCAL_KEY)) || {};
+            return { items: db.items || [], seq: db.seq || 1 };
+          } catch (_) { return { items: [], seq: 1 }; }
+        },
+        _save(db) { try { localStorage.setItem(LOCAL_KEY, JSON.stringify(db)); } catch (_) {} },
+        async list() {
+          return this._load().items.slice().sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+        },
+        async add(entry) {
+          const db = this._load();
+          const dup = db.items.find(
+            (r) => r.type === entry.type &&
+              String(r.term).toLowerCase() === String(entry.term).toLowerCase()
+          );
+          if (dup) { const e = new Error('duplicate'); e.code = '23505'; throw e; }
+          const row = {
+            id: db.seq++, known: false, review_count: 0, wrong_count: 0,
+            last_reviewed_at: null, created_at: new Date().toISOString(), ...entry,
+          };
+          db.items.push(row);
+          this._save(db);
+          return row;
+        },
+        async remove(id) {
+          const db = this._load();
+          db.items = db.items.filter((r) => r.id !== id);
+          this._save(db);
+        },
+        async update(id, patch) {
+          const db = this._load();
+          db.items = db.items.map((r) => (r.id === id ? { ...r, ...patch } : r));
+          this._save(db);
+        },
+      };
+
+      const supaVocabStore = {
+        async list() {
+          const { data, error } = await sb
+            .from('vocab_entries').select('*').order('created_at', { ascending: false });
+          if (error) throw error;
+          return data;
+        },
+        async add(entry) {
+          const { data, error } = await sb
+            .from('vocab_entries').insert(entry).select().single();
+          if (error) throw error;
+          return data;
+        },
+        async remove(id) {
+          const { error } = await sb.from('vocab_entries').delete().eq('id', id);
+          if (error) throw error;
+        },
+        async update(id, patch) {
+          const { error } = await sb.from('vocab_entries').update(patch).eq('id', id);
+          if (error) throw error;
+        },
+      };
+
+      const store = isLocalMode ? localVocabStore : supaVocabStore;
+
+      function LoginForm({ onSubmit, error }) {
+        const [email, setEmail] = useState('');
+        const [password, setPassword] = useState('');
+        return (
+          <form className="space-y-3 max-w-sm mx-auto"
+            onSubmit={(e) => { e.preventDefault(); onSubmit(email, password); }}>
+            <p className="text-sm text-slate-500 text-center pb-1">
+              chunk-and-catch 와 같은 계정으로 로그인하세요.
+            </p>
+            {error && <div className="p-3 bg-red-50 text-red-700 rounded-xl text-sm">⚠️ {error}</div>}
+            <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
+              placeholder="이메일" autoComplete="username"
+              className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)}
+              placeholder="비밀번호" autoComplete="current-password"
+              className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            <button type="submit"
+              className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl transition-colors">
+              로그인
+            </button>
+          </form>
+        );
+      }
+
+      function App() {
+        const [ready, setReady] = useState(false);
+        const [session, setSession] = useState(null);
+        const [vocab, setVocab] = useState([]);
+        const [err, setErr] = useState('');
+        const [notice, setNotice] = useState('');
+
+        const [view, setView] = useState('list');        // list | cards | stats
+        const [query, setQuery] = useState('');
+        const [filter, setFilter] = useState('all');     // all | unknown | known
+        const [sort, setSort] = useState('recent');      // recent | alpha | wrong
+        const [hideMeaning, setHideMeaning] = useState(false);
+        const [revealed, setRevealed] = useState({});
+
+        const [adding, setAdding] = useState(false);
+        const [newTerm, setNewTerm] = useState('');
+        const [newMeaning, setNewMeaning] = useState('');
+
+        const [deck, setDeck] = useState([]);
+        const [cardIdx, setCardIdx] = useState(0);
+        const [flipped, setFlipped] = useState(false);
+        const [cardResults, setCardResults] = useState({});
+
+        const loggedIn = isLocalMode || !!session;
+
+        // 음성 목록 워밍업 (첫 재생이 무음으로 나가는 것 방지)
+        useEffect(() => {
+          if ('speechSynthesis' in window) {
+            const warm = () => window.speechSynthesis.getVoices();
+            warm();
+            window.speechSynthesis.addEventListener('voiceschanged', warm);
+            return () => window.speechSynthesis.removeEventListener('voiceschanged', warm);
+          }
+        }, []);
+
+        const speak = (text) => {
+          if (!('speechSynthesis' in window)) return setErr('이 브라우저는 음성 듣기를 지원하지 않습니다.');
+          window.speechSynthesis.cancel();
+          const u = new SpeechSynthesisUtterance(text);
+          u.rate = 0.9;
+          u.lang = 'en-US';
+          const voices = window.speechSynthesis.getVoices();
+          const v = voices.find((x) => x.lang.includes('en-US') && x.localService) ||
+                    voices.find((x) => x.lang.includes('en-US'));
+          if (v) u.voice = v;
+          window.speechSynthesis.speak(u);
+        };
+
+        const reload = async () => {
+          try { setVocab(await store.list()); setErr(''); }
+          catch (e) { console.error(e); setErr('단어장을 불러오지 못했습니다.'); }
+        };
+
+        useEffect(() => {
+          let alive = true;
+          (async () => {
+            if (isLocalMode) { await reload(); setReady(true); return; }
+            const { data } = await sb.auth.getSession();
+            if (!alive) return;
+            setSession(data.session);
+            if (data.session) await reload();
+            setReady(true);
+            sb.auth.onAuthStateChange((_e, s) => {
+              setSession(s);
+              if (s) reload(); else setVocab([]);
+            });
+          })();
+          return () => { alive = false; };
+        }, []);
+
+        // 이전 화면의 오류/안내가 다음 화면까지 따라오지 않도록 정리
+        useEffect(() => { setErr(''); setNotice(''); }, [view]);
+
+        const handleLogin = async (email, password) => {
+          const { error } = await sb.auth.signInWithPassword({ email, password });
+          if (error) { setErr('로그인에 실패했습니다. 이메일/비밀번호를 확인해 주세요.'); return; }
+          setErr('');
+        };
+
+        const addWord = async (e) => {
+          e.preventDefault();
+          const term = newTerm.trim(), meaning = newMeaning.trim();
+          if (!term || !meaning) return setErr('단어와 뜻을 모두 입력해 주세요.');
+          try {
+            const row = await store.add({ type: 'word', term, meaning, source_sentence: null });
+            setVocab((l) => [row, ...l]);
+            setNewTerm(''); setNewMeaning(''); setErr('');
+            setNotice('“' + term + '” 을(를) 담았습니다.');
+            setTimeout(() => setNotice(''), 2500);
+          } catch (e2) {
+            console.error(e2);
+            setErr(e2 && e2.code === '23505'
+              ? '이미 단어장에 있는 단어입니다.'
+              : '저장하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+          }
+        };
+
+        const removeEntry = async (id) => {
+          setVocab((l) => l.filter((v) => v.id !== id));
+          try { await store.remove(id); } catch (e) { console.error(e); reload(); }
+        };
+
+        const toggleKnown = async (entry) => {
+          const patch = { known: !entry.known };
+          setVocab((l) => l.map((v) => (v.id === entry.id ? { ...v, ...patch } : v)));
+          try { await store.update(entry.id, patch); } catch (e) { console.error(e); reload(); }
+        };
+
+        const visible = useMemo(() => {
+          const q = query.trim().toLowerCase();
+          let list = vocab.filter((v) => {
+            if (filter === 'unknown' && v.known) return false;
+            if (filter === 'known' && !v.known) return false;
+            if (!q) return true;
+            return (v.term + ' ' + v.meaning).toLowerCase().includes(q);
+          });
+          if (sort === 'alpha') list = list.slice().sort((a, b) => a.term.localeCompare(b.term));
+          else if (sort === 'wrong') list = list.slice().sort((a, b) => (b.wrong_count || 0) - (a.wrong_count || 0));
+          return list;
+        }, [vocab, query, filter, sort]);
+
+        // ── 플래시카드 ──
+        const shuffle = (arr) => {
+          const a = arr.slice();
+          for (let i = a.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [a[i], a[j]] = [a[j], a[i]];
+          }
+          return a;
+        };
+        const startCards = (items) => {
+          if (!items.length) { setErr('학습할 단어가 없습니다. 필터를 바꾸거나 단어를 추가해 주세요.'); return; }
+          setDeck(shuffle(items)); setCardIdx(0); setFlipped(false); setCardResults({});
+          setView('cards');
+        };
+        const gradeCard = async (entry, isKnown) => {
+          setCardResults((r) => ({ ...r, [entry.id]: isKnown }));
+          setCardIdx((i) => i + 1);
+          setFlipped(false);
+          const patch = {
+            known: isKnown,
+            review_count: (entry.review_count || 0) + 1,
+            wrong_count: (entry.wrong_count || 0) + (isKnown ? 0 : 1),
+            last_reviewed_at: new Date().toISOString(),
+          };
+          setVocab((l) => l.map((v) => (v.id === entry.id ? { ...v, ...patch } : v)));
+          try { await store.update(entry.id, patch); }
+          catch (e) { console.error(e); setErr('학습 기록을 저장하지 못했습니다.'); }
+        };
+
+        const cardDone = deck.length > 0 && cardIdx >= deck.length;
+        const knownInRun = Object.values(cardResults).filter(Boolean).length;
+        const wrongList = deck.filter((d) => cardResults[d.id] === false);
+        const card = deck[cardIdx];
+
+        // ── 통계 ──
+        const stats = useMemo(() => {
+          const total = vocab.length;
+          const known = vocab.filter((v) => v.known).length;
+          const reviewed = vocab.filter((v) => v.last_reviewed_at);
+          const last = reviewed.length
+            ? reviewed.map((v) => v.last_reviewed_at).sort().slice(-1)[0]
+            : null;
+          return {
+            total, known, left: total - known,
+            pct: total ? Math.round((known / total) * 100) : 0,
+            words: vocab.filter((v) => v.type === 'word').length,
+            idioms: vocab.filter((v) => v.type === 'idiom').length,
+            hardest: vocab.filter((v) => (v.wrong_count || 0) > 0)
+              .sort((a, b) => (b.wrong_count || 0) - (a.wrong_count || 0)).slice(0, 5),
+            lastReviewed: last,
+          };
+        }, [vocab]);
+
+        const Chip = ({ active, onClick, children }) => (
+          <button onClick={onClick}
+            className={'px-3 py-1.5 rounded-xl text-sm font-medium border transition-colors ' + (active
+              ? 'bg-emerald-600 border-emerald-600 text-white'
+              : 'bg-white border-slate-300 text-slate-600 hover:bg-slate-50')}>
+            {children}
+          </button>
+        );
+
+        if (!ready) {
+          return (
+            <div className="min-h-screen flex items-center justify-center text-slate-400">
+              <span className="spin inline-block mr-2">⏳</span> 불러오는 중…
+            </div>
+          );
+        }
+
+        return (
+          <div className="min-h-screen bg-slate-50 text-slate-800 p-4 md:p-8">
+            <div className="max-w-3xl mx-auto space-y-5">
+
+              <div className="text-center space-y-1">
+                <div className="inline-flex items-center justify-center p-3 bg-emerald-100 rounded-2xl mb-2 text-3xl">📒</div>
+                <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">내 단어장</h1>
+                <p className="text-slate-500 text-sm">담아둔 단어와 구동사를 복습하세요.</p>
+                <div className="pt-2">
+                  <a href="/" className="text-sm text-slate-400 hover:text-emerald-600 transition-colors">
+                    ← 문장 분석하러 가기
+                  </a>
+                </div>
+              </div>
+
+              {!loggedIn ? (
+                <div className="bg-white rounded-3xl shadow-sm border border-slate-200 p-6 md:p-8">
+                  <LoginForm onSubmit={handleLogin} error={err} />
+                </div>
+              ) : (
+                <>
+                  <div className="flex justify-center gap-2">
+                    <Chip active={view === 'list'} onClick={() => setView('list')}>📋 목록</Chip>
+                    <Chip active={view === 'cards'} onClick={() => startCards(visible)}>🎴 카드 학습</Chip>
+                    <Chip active={view === 'stats'} onClick={() => setView('stats')}>📊 통계</Chip>
+                  </div>
+
+                  {err && <div className="p-3 bg-red-50 text-red-700 rounded-xl text-sm">⚠️ {err}</div>}
+                  {notice && <div className="p-3 bg-emerald-50 text-emerald-700 rounded-xl text-sm">✅ {notice}</div>}
+
+                  {view === 'list' && (
+                    <div className="bg-white rounded-3xl shadow-sm border border-slate-200 p-5 md:p-6 space-y-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <h2 className="font-bold text-slate-900">총 {vocab.length}개</h2>
+                        <button onClick={() => setAdding(!adding)}
+                          className="px-3 py-2 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-700 text-white transition-colors">
+                          {adding ? '닫기' : '＋ 단어 추가'}
+                        </button>
+                      </div>
+
+                      {adding && (
+                        <form onSubmit={addWord} className="p-4 bg-slate-50 rounded-2xl space-y-3">
+                          <input value={newTerm} onChange={(e) => setNewTerm(e.target.value)}
+                            placeholder="단어 또는 표현 (예: come across)"
+                            className="w-full p-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+                          <input value={newMeaning} onChange={(e) => setNewMeaning(e.target.value)}
+                            placeholder="뜻 (예: 우연히 마주치다)"
+                            className="w-full p-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+                          <button type="submit"
+                            className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl transition-colors">
+                            담기
+                          </button>
+                        </form>
+                      )}
+
+                      <input value={query} onChange={(e) => setQuery(e.target.value)}
+                        placeholder="단어 또는 뜻으로 검색"
+                        className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+
+                      <div className="flex flex-wrap gap-2">
+                        <Chip active={filter === 'all'} onClick={() => setFilter('all')}>전체</Chip>
+                        <Chip active={filter === 'unknown'} onClick={() => setFilter('unknown')}>못 외운 것</Chip>
+                        <Chip active={filter === 'known'} onClick={() => setFilter('known')}>외운 것</Chip>
+                        <span className="w-px bg-slate-200 mx-1" />
+                        <Chip active={hideMeaning} onClick={() => { setHideMeaning(!hideMeaning); setRevealed({}); }}>
+                          {hideMeaning ? '🙈 가리는 중' : '👁️ 뜻 가리기'}
+                        </Chip>
+                      </div>
+
+                      <div className="flex items-center gap-2 text-sm text-slate-500">
+                        정렬
+                        <select value={sort} onChange={(e) => setSort(e.target.value)}
+                          className="p-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-700">
+                          <option value="recent">최신순</option>
+                          <option value="alpha">가나다·ABC</option>
+                          <option value="wrong">많이 틀린 순</option>
+                        </select>
+                        <span className="ml-auto">{visible.length}개 표시</span>
+                      </div>
+
+                      <div className="space-y-2">
+                        {visible.map((v) => {
+                          const open = !hideMeaning || revealed[v.id];
+                          return (
+                            <div key={v.id} className="flex items-start gap-3 p-3 border border-slate-200 rounded-xl hover:border-slate-300 transition-colors">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <strong className="text-slate-900">{v.term}</strong>
+                                  {v.type === 'idiom' && (
+                                    <span className="text-[11px] px-1.5 py-0.5 bg-amber-100 text-amber-700 rounded">구동사</span>
+                                  )}
+                                  <button onClick={() => toggleKnown(v)}
+                                    title={v.known ? '아직 못 외웠다고 표시' : '외웠다고 표시'}
+                                    className={'text-[11px] px-1.5 py-0.5 rounded transition-colors ' + (v.known
+                                      ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'
+                                      : 'bg-slate-100 text-slate-400 hover:bg-slate-200')}>
+                                    {v.known ? '외움' : '외우는 중'}
+                                  </button>
+                                  {(v.wrong_count || 0) > 0 && (
+                                    <span className="text-[11px] text-red-400">✕{v.wrong_count}</span>
+                                  )}
+                                </div>
+                                <div onClick={() => setRevealed((r) => ({ ...r, [v.id]: true }))}
+                                  className={'mt-1 text-sm ' + (open ? 'text-slate-600' : 'bg-slate-200 text-transparent rounded cursor-pointer select-none')}>
+                                  {open ? v.meaning : '뜻 보기'}
+                                </div>
+                                {v.source_sentence && (
+                                  <p className="mt-1.5 text-xs text-slate-400 italic">{v.source_sentence}</p>
+                                )}
+                              </div>
+                              <div className="shrink-0 flex items-center gap-1">
+                                <button onClick={() => speak(v.term)}
+                                  className="text-slate-300 hover:text-emerald-600 transition-colors px-1" title="발음 듣기">🔊</button>
+                                <button onClick={() => removeEntry(v.id)}
+                                  className="text-slate-300 hover:text-red-500 transition-colors px-1" title="삭제">✕</button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                        {!visible.length && (
+                          <p className="p-8 text-center text-slate-400 text-sm">
+                            {vocab.length ? '조건에 맞는 단어가 없습니다.' : '아직 담은 단어가 없습니다. ＋ 단어 추가를 눌러보세요.'}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {view === 'cards' && (
+                    <div className="bg-white rounded-3xl shadow-sm border border-slate-200 p-6 md:p-8 space-y-5">
+                      {!cardDone && card ? (
+                        <>
+                          <div className="flex items-center justify-between gap-3">
+                            <button onClick={() => setView('list')}
+                              className="text-slate-500 hover:text-slate-800 font-medium">← 목록</button>
+                            <div className="flex items-center gap-3">
+                              <button onClick={() => speak(card.term)}
+                                className="text-slate-400 hover:text-emerald-600 transition-colors" title="발음 듣기">🔊</button>
+                              <span className="text-sm text-slate-400 font-medium">{cardIdx + 1} / {deck.length}</span>
+                            </div>
+                          </div>
+                          <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                            <div className="h-full bg-emerald-500 transition-all"
+                              style={{ width: (cardIdx / deck.length) * 100 + '%' }} />
+                          </div>
+                          <div onClick={() => setFlipped((f) => !f)}
+                            className="min-h-56 flex flex-col items-center justify-center text-center gap-3 p-6 bg-slate-50 border-2 border-slate-200 rounded-2xl cursor-pointer select-none hover:border-emerald-300 transition-colors">
+                            {!flipped ? (
+                              <>
+                                <div className="text-3xl font-extrabold text-slate-900 break-words">{card.term}</div>
+                                <div className="text-sm text-slate-400">탭하면 뜻이 보입니다</div>
+                              </>
+                            ) : (
+                              <>
+                                <div className="text-2xl font-bold text-emerald-700 break-words">{card.meaning}</div>
+                                {card.source_sentence && (
+                                  <p className="text-sm text-slate-500 italic leading-relaxed">{card.source_sentence}</p>
+                                )}
+                              </>
+                            )}
+                          </div>
+                          {flipped && (
+                            <div className="grid grid-cols-2 gap-3">
+                              <button onClick={() => gradeCard(card, false)}
+                                className="py-4 rounded-2xl font-bold bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 transition-colors">
+                                ❌ 몰라요
+                              </button>
+                              <button onClick={() => gradeCard(card, true)}
+                                className="py-4 rounded-2xl font-bold bg-emerald-600 text-white hover:bg-emerald-700 transition-colors">
+                                ✅ 알아요
+                              </button>
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <div className="text-center space-y-5 py-6">
+                          <div className="text-5xl">🎉</div>
+                          <h2 className="text-2xl font-extrabold text-slate-900">학습 완료!</h2>
+                          <p className="text-slate-600">
+                            총 <strong>{deck.length}</strong>장 중{' '}
+                            <strong className="text-emerald-600">{knownInRun}개</strong>를 외웠고,{' '}
+                            <strong className="text-red-500">{wrongList.length}개</strong>가 남았습니다.
+                          </p>
+                          <div className="flex flex-col sm:flex-row gap-3 justify-center">
+                            {wrongList.length > 0 && (
+                              <button onClick={() => startCards(wrongList)}
+                                className="px-6 py-3 rounded-2xl font-bold bg-emerald-600 text-white hover:bg-emerald-700 transition-colors">
+                                모르는 것만 다시 ({wrongList.length})
+                              </button>
+                            )}
+                            <button onClick={() => setView('list')}
+                              className="px-6 py-3 rounded-2xl font-bold border border-slate-300 text-slate-600 hover:bg-slate-50 transition-colors">
+                              목록으로
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {view === 'stats' && (
+                    <div className="bg-white rounded-3xl shadow-sm border border-slate-200 p-6 md:p-8 space-y-6">
+                      <div className="flex items-center justify-between">
+                        <h2 className="text-xl font-extrabold text-slate-900">📊 학습 통계</h2>
+                        <button onClick={() => setView('list')}
+                          className="text-slate-500 hover:text-slate-800 text-sm font-medium">← 목록</button>
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-3 text-center">
+                        <div className="p-4 bg-slate-50 rounded-2xl">
+                          <div className="text-2xl font-extrabold text-slate-900">{stats.total}</div>
+                          <div className="text-xs text-slate-500 mt-1">전체</div>
+                        </div>
+                        <div className="p-4 bg-emerald-50 rounded-2xl">
+                          <div className="text-2xl font-extrabold text-emerald-700">{stats.known}</div>
+                          <div className="text-xs text-emerald-600 mt-1">외움</div>
+                        </div>
+                        <div className="p-4 bg-amber-50 rounded-2xl">
+                          <div className="text-2xl font-extrabold text-amber-700">{stats.left}</div>
+                          <div className="text-xs text-amber-600 mt-1">남음</div>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <div className="flex justify-between text-sm text-slate-500">
+                          <span>진행률</span><span className="font-bold text-slate-700">{stats.pct}%</span>
+                        </div>
+                        <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
+                          <div className="h-full bg-emerald-500 transition-all" style={{ width: stats.pct + '%' }} />
+                        </div>
+                      </div>
+
+                      <div className="flex gap-3 text-sm text-slate-600">
+                        <div className="flex-1 p-3 bg-slate-50 rounded-xl">
+                          단어 <strong className="text-slate-900">{stats.words}</strong>개
+                        </div>
+                        <div className="flex-1 p-3 bg-slate-50 rounded-xl">
+                          구동사 <strong className="text-slate-900">{stats.idioms}</strong>개
+                        </div>
+                      </div>
+
+                      <div>
+                        <h3 className="font-bold text-slate-700 mb-2 text-sm">자주 틀리는 단어</h3>
+                        {stats.hardest.length ? (
+                          <div className="space-y-1.5">
+                            {stats.hardest.map((v, i) => (
+                              <div key={v.id} className="flex items-center gap-3 p-2.5 border border-slate-200 rounded-xl text-sm">
+                                <span className="text-slate-300 font-bold w-4">{i + 1}</span>
+                                <strong className="text-slate-900">{v.term}</strong>
+                                <span className="text-slate-500 truncate flex-1">{v.meaning}</span>
+                                <span className="text-red-500 font-bold shrink-0">{v.wrong_count}회</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-slate-400">아직 틀린 기록이 없습니다.</p>
+                        )}
+                      </div>
+
+                      <p className="text-xs text-slate-400">
+                        마지막 학습:{' '}
+                        {stats.lastReviewed
+                          ? new Date(stats.lastReviewed).toLocaleString('ko-KR')
+                          : '아직 없음'}
+                      </p>
+                    </div>
+                  )}
+
+                  {!isLocalMode && (
+                    <div className="text-center">
+                      <button onClick={() => sb.auth.signOut()}
+                        className="text-sm text-slate-400 hover:text-slate-600 transition-colors">로그아웃</button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+  </body>
+</html>
