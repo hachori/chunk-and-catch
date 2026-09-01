@@ -3,6 +3,8 @@
 
 create table if not exists vocab_entries (
   id bigint generated always as identity primary key,
+  -- 소유자. 기본값이 auth.uid() 라 클라이언트가 따로 넣지 않아도 채워진다.
+  user_id uuid not null default auth.uid(),
   type text not null default 'word' check (type in ('word', 'idiom')),
   term text not null,
   meaning text not null,
@@ -15,15 +17,18 @@ create table if not exists vocab_entries (
   created_at timestamptz not null default now()
 );
 
--- 같은 단어를 여러 문장에서 만나도 한 번만 쌓이게
+-- 같은 단어를 여러 문장에서 만나도 한 번만 쌓이게 (사용자 단위)
 create unique index if not exists vocab_entries_term_uniq
-  on vocab_entries (type, lower(term));
+  on vocab_entries (user_id, type, lower(term));
 
 create index if not exists vocab_entries_created_idx
   on vocab_entries (created_at desc);
 
--- RLS: 로그인(authenticated)한 사용자만 읽기/쓰기 가능
+-- RLS: 로그인한 사용자가 '자기 행만' 읽고 쓸 수 있다.
+-- (authenticated 전체 허용으로 두면 아무나 가입해서 남의 단어장을 보게 된다)
 alter table vocab_entries enable row level security;
 
-create policy "authenticated full access" on vocab_entries
-  for all to authenticated using (true) with check (true);
+create policy "own rows only" on vocab_entries
+  for all to authenticated
+  using (user_id = auth.uid())
+  with check (user_id = auth.uid());
