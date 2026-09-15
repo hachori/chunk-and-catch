@@ -184,6 +184,8 @@
       function App() {
         const [activeTab, setActiveTab] = useState('image');
         const [textInput, setTextInput] = useState('');
+        const [textUsed, setTextUsed] = useState(false);   // 이미 분석에 쓴 입력인지 (다음 터치 때 비움)
+        const [lastCleared, setLastCleared] = useState(''); // 자동으로 비운 문장 (되돌리기용)
         const [imagePreview, setImagePreview] = useState(null);
         const [originalSrc, setOriginalSrc] = useState(null);
         const [crop, setCrop] = useState(null);
@@ -481,6 +483,13 @@
           catch (e) { console.error(e); setVocabError('학습 기록을 저장하지 못했습니다.'); }
         };
 
+        // 분석이 끝난 문장은 다음 입력 때 걸리적거리므로 한 번에 비운다 (되돌리기 가능)
+        const clearTextInput = () => {
+          setLastCleared(textInput);
+          setTextInput('');
+          setTextUsed(false);
+        };
+
         const analyzeContent = async () => {
           setError('');
           setResult(null);
@@ -506,6 +515,7 @@
             if (!res.ok) throw new Error((data && data.error) || ('요청 실패 (' + res.status + ')'));
             if (!data.sentences) throw new Error('결과를 받아오지 못했습니다.');
             setResult(data);
+            if (activeTab === 'text') setTextUsed(true);
           } catch (e) {
             console.error(e);
             setError(e.message || '분석 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.');
@@ -626,12 +636,29 @@
 
                   {activeTab === 'text' && (
                     <div className="space-y-3">
-                      <label className="block text-sm font-semibold text-slate-700">해석이 어려운 영어 문장들 (여러 문장 가능)</label>
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="block text-sm font-semibold text-slate-700">해석이 어려운 영어 문장들 (여러 문장 가능)</label>
+                        {textInput.trim() ? (
+                          <button type="button" onClick={clearTextInput}
+                            className="shrink-0 text-xs px-2.5 py-1 rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-slate-700 transition-colors">
+                            ✕ 지우기
+                          </button>
+                        ) : lastCleared ? (
+                          <button type="button" onClick={() => { setTextInput(lastCleared); setLastCleared(''); }}
+                            className="shrink-0 text-xs px-2.5 py-1 rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-slate-700 transition-colors">
+                            ↩ 지운 문장 되돌리기
+                          </button>
+                        ) : null}
+                      </div>
                       <textarea
                         className="w-full h-40 p-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all resize-none"
                         placeholder="여러 문장을 한 번에 입력하셔도 됩니다. 예: I couldn't put up with his behavior anymore. So I decided to call off the meeting."
                         value={textInput}
-                        onChange={(e) => setTextInput(e.target.value)} />
+                        onFocus={() => { if (textUsed) clearTextInput(); }}
+                        onChange={(e) => { setTextInput(e.target.value); setTextUsed(false); }} />
+                      {textUsed && textInput.trim() && (
+                        <p className="text-xs text-slate-400">✓ 분석에 사용한 문장입니다. 입력창을 터치하면 새 문장을 위해 자동으로 비워져요.</p>
+                      )}
                     </div>
                   )}
 
