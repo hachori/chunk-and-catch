@@ -152,6 +152,35 @@
       // 같은 단어인지 판정하는 키 (대소문자 무시)
       const vocabKey = (type, term) => type + '|' + String(term).trim().toLowerCase();
 
+      // ── Opta(The Analyst) 기사 읽기 진행 상황 ────────────────────
+      // 어느 단락까지 분석했는지는 기기별 학습 기록이라 서버에 둘 이유가 없다.
+      const OPTA_KEY = 'chunk-and-catch-opta-progress';
+      const optaProgress = {
+        _load() {
+          try { return JSON.parse(localStorage.getItem(OPTA_KEY)) || {}; }
+          catch (_) { return {}; }
+        },
+        get(articleId) { return this._load()[articleId] || []; },
+        mark(articleId, index) {
+          const db = this._load();
+          const done = new Set(db[articleId] || []);
+          done.add(index);
+          db[articleId] = Array.from(done).sort((a, b) => a - b);
+          // 매일 한 편씩 쌓이므로 오래된 기사 기록은 버린다 (localStorage 용량 보호)
+          const ids = Object.keys(db);
+          if (ids.length > 40) ids.slice(0, ids.length - 40).forEach((k) => delete db[k]);
+          try { localStorage.setItem(OPTA_KEY, JSON.stringify(db)); } catch (_) {}
+          return db[articleId];
+        },
+      };
+
+      const formatArticleDate = (iso) => {
+        if (!iso) return '';
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return '';
+        return d.toLocaleDateString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' });
+      };
+
       function LoginForm({ onSubmit }) {
         const [email, setEmail] = useState('');
         const [password, setPassword] = useState('');
@@ -182,7 +211,8 @@
       }
 
       function App() {
-        const [activeTab, setActiveTab] = useState('image');
+        // 앱을 열면 바로 오늘의 기사가 보이도록 기본 탭을 Opta 로 둔다.
+        const [activeTab, setActiveTab] = useState('opta');
         const [textInput, setTextInput] = useState('');
         const [textUsed, setTextUsed] = useState(false);   // 이미 분석에 쓴 입력인지 (다음 터치 때 비움)
         const [lastCleared, setLastCleared] = useState(''); // 자동으로 비운 문장 (되돌리기용)
@@ -192,6 +222,15 @@
         const [isLoading, setIsLoading] = useState(false);
         const [result, setResult] = useState(null);
         const [error, setError] = useState('');
+
+        // ── Opta 기사 상태 ──
+        const [optaArticle, setOptaArticle] = useState(null);
+        const [optaRecent, setOptaRecent] = useState([]);   // 최근 기사 목록 (다른 기사 고르기)
+        const [optaLoading, setOptaLoading] = useState(false);
+        const [optaError, setOptaError] = useState('');
+        const [optaIdx, setOptaIdx] = useState(-1);         // 지금 고른 단락 번호 (-1 = 없음)
+        const [optaDone, setOptaDone] = useState([]);       // 이미 분석한 단락 번호들
+        const [optaPicker, setOptaPicker] = useState(false);
 
         // ── 단어장 상태 ──
         const [view, setView] = useState('analyze');       // analyze | vocab | cards
@@ -483,6 +522,45 @@
           catch (e) { console.error(e); setVocabError('학습 기록을 저장하지 못했습니다.'); }
         };
 
+        // ── Opta 기사 불러오기 ───────────────────────────────────────
+        // 인자 없이 부르면 서버가 고른 '오늘의 기사', id 를 주면 그 기사를 가져온다.
+        const applyArticle = (article) => {
+          const done = optaProgress.get(article.id);
+          setOptaArticle(article);
+          setOptaDone(done);
+          // 이어 읽기: 아직 분석하지 않은 첫 본문 단락으로 커서를 옮긴다.
+          setOptaIdx(article.paragraphs.findIndex(
+            (para, i) => para.type === 'text' && done.indexOf(i) === -1
+          ));
+          setOptaPicker(false);
+          setResult(null);
+          setError('');
+        };
+
+        const loadOpta = async (id) => {
+          setOptaLoading(true);
+          setOptaError('');
+          try {
+            const res = await fetch('/api/opta' + (id ? '?id=' + id : ''));
+            const data = await res.json();
+            if (!res.ok) throw new Error((data && data.error) || ('요청 실패 (' + res.status + ')'));
+            const article = data.article || data.today;
+            if (!article) throw new Error('가져올 기사를 찾지 못했습니다.');
+            if (data.recent) setOptaRecent(data.recent);
+            applyArticle(article);
+          } catch (e) {
+            console.error(e);
+            setOptaError(e.message || '기사를 불러오지 못했습니다.');
+          } finally {
+            setOptaLoading(false);
+          }
+        };
+
+        // 탭을 처음 열 때 한 번만. 실패했으면 '다시 시도' 버튼으로만 재요청한다.
+        useEffect(() => {
+          if (activeTab === 'opta' && !optaArticle && !optaLoading && !optaError) loadOpta();
+        }, [activeTab]);
+
         // 분석이 끝난 문장은 다음 입력 때 걸리적거리므로 한 번에 비운다 (되돌리기 가능)
         const clearTextInput = () => {
           setLastCleared(textInput);
@@ -490,17 +568,25 @@
           setTextUsed(false);
         };
 
+        // 기사에서 지금 고른 단락 (없으면 빈 문자열)
+        const optaParagraphs = (optaArticle && optaArticle.paragraphs) || [];
+        const optaSelected =
+          optaIdx >= 0 && optaParagraphs[optaIdx] ? optaParagraphs[optaIdx].text : '';
+
         const analyzeContent = async () => {
           setError('');
           setResult(null);
           if (activeTab === 'text' && !textInput.trim()) return setError('분석할 영어 문장을 입력해 주세요.');
           if (activeTab === 'image' && !imagePreview) return setError('분석할 이미지를 업로드해 주세요.');
+          if (activeTab === 'opta' && !optaSelected) return setError('분석할 단락을 하나 골라 주세요.');
 
           setIsLoading(true);
           try {
             let body;
             if (activeTab === 'text') {
               body = { mode: 'text', text: textInput };
+            } else if (activeTab === 'opta') {
+              body = { mode: 'text', text: optaSelected };
             } else {
               // 선택 영역이 있으면 원본에서 그 부분만 잘라 보낸다 (crop 이 null 이면 전체)
               const shot = await renderImage(originalSrc, crop);
@@ -516,6 +602,7 @@
             if (!data.sentences) throw new Error('결과를 받아오지 못했습니다.');
             setResult(data);
             if (activeTab === 'text') setTextUsed(true);
+            if (activeTab === 'opta') setOptaDone(optaProgress.mark(optaArticle.id, optaIdx));
           } catch (e) {
             console.error(e);
             setError(e.message || '분석 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.');
@@ -527,6 +614,21 @@
         // 모델이 가끔 내용 없는 빈 문장 객체를 반환하므로 걸러냄
         const sentences = (result && Array.isArray(result.sentences) ? result.sentences : [])
           .filter((s) => s && s.original_sentence && s.original_sentence.trim());
+
+        // 소제목은 건너뛰고 본문 단락에만 번호를 매긴다 (화면 표시·진행률용)
+        let optaNo = 0;
+        const optaNumbered = optaParagraphs.map((para) =>
+          para.type === 'text' ? { ...para, no: ++optaNo } : para);
+        const optaTextCount = optaNo;
+        const optaStep = (dir) => {
+          for (let i = optaIdx + dir; i >= 0 && i < optaParagraphs.length; i += dir) {
+            if (optaParagraphs[i].type === 'text') return i;
+          }
+          return -1;
+        };
+        const optaPrev = optaIdx >= 0 ? optaStep(-1) : -1;
+        const optaNext = optaIdx >= 0 ? optaStep(1) : -1;
+        const gotoParagraph = (i) => { setOptaIdx(i); setResult(null); setError(''); };
 
         const cardDone = deck.length > 0 && cardIdx >= deck.length;
         const cardKnownCount = Object.values(cardResults).filter(Boolean).length;
@@ -553,17 +655,124 @@
               {view === 'analyze' && (<>
               <div className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
                 <div className="flex border-b border-slate-100">
-                  <button onClick={() => setActiveTab('image')}
-                    className={'flex-1 flex items-center justify-center gap-2 py-4 font-medium transition-colors ' + (activeTab === 'image' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50/30' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50')}>
-                    📷 페이지 전체 업로드
-                  </button>
-                  <button onClick={() => setActiveTab('text')}
-                    className={'flex-1 flex items-center justify-center gap-2 py-4 font-medium transition-colors ' + (activeTab === 'text' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50/30' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50')}>
-                    ⌨️ 여러 문장 타이핑
-                  </button>
+                  {[
+                    ['opta', '⚽', '오늘의 EPL 기사', 'EPL'],
+                    ['image', '📷', '페이지 전체 업로드', '사진'],
+                    ['text', '⌨️', '여러 문장 타이핑', '타이핑'],
+                  ].map(([key, icon, label, short]) => (
+                    <button key={key} onClick={() => setActiveTab(key)}
+                      className={'flex-1 flex items-center justify-center gap-1.5 py-4 font-medium transition-colors ' + (activeTab === key ? 'text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50/30' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50')}>
+                      {icon}
+                      <span className="hidden sm:inline">{label}</span>
+                      <span className="sm:hidden text-sm">{short}</span>
+                    </button>
+                  ))}
                 </div>
 
                 <div className="p-6 md:p-8 space-y-6">
+                  {activeTab === 'opta' && (
+                    <div className="space-y-4">
+                      {optaLoading && !optaArticle && (
+                        <div className="flex items-center justify-center gap-2 py-10 text-slate-500">
+                          <span className="spin inline-block">⏳</span> 오늘의 프리미어리그 기사를 가져오는 중...
+                        </div>
+                      )}
+
+                      {optaError && (
+                        <div className="p-4 bg-amber-50 text-amber-800 rounded-xl text-sm space-y-3">
+                          <p>⚠️ {optaError}</p>
+                          <button type="button" onClick={() => loadOpta()}
+                            className="px-3 py-1.5 rounded-lg bg-white border border-amber-300 text-amber-800 font-medium hover:bg-amber-100 transition-colors">
+                            다시 시도
+                          </button>
+                        </div>
+                      )}
+
+                      {optaArticle && (<>
+                        <div className="p-4 bg-slate-50 rounded-2xl space-y-2">
+                          <div className="flex items-center gap-2 text-xs text-slate-400">
+                            <span>{formatArticleDate(optaArticle.publishedAt)}</span>
+                            <span>·</span>
+                            <span>The Analyst (Opta)</span>
+                            <span className="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded font-medium">프리미어리그</span>
+                          </div>
+                          <h2 className="font-bold text-lg leading-snug text-slate-900">{optaArticle.title}</h2>
+                          {optaArticle.excerpt && (
+                            <p className="text-sm text-slate-500 leading-relaxed">{optaArticle.excerpt}</p>
+                          )}
+                          <div className="flex flex-wrap items-center gap-3 pt-1">
+                            <a href={optaArticle.link} target="_blank" rel="noopener noreferrer"
+                              className="text-xs font-medium text-indigo-600 hover:text-indigo-800 transition-colors">
+                              원문 보기 ↗
+                            </a>
+                            <button type="button" onClick={() => setOptaPicker((v) => !v)}
+                              className="text-xs font-medium text-slate-500 hover:text-indigo-600 transition-colors">
+                              {optaPicker ? '목록 닫기' : '다른 기사 고르기'}
+                            </button>
+                            <span className="text-xs text-slate-400 ml-auto">
+                              {optaDone.length} / {optaTextCount} 단락 분석함
+                            </span>
+                          </div>
+                        </div>
+
+                        {optaPicker && (
+                          <div className="border border-slate-200 rounded-2xl divide-y divide-slate-100 max-h-64 overflow-y-auto">
+                            {optaRecent.length === 0 && (
+                              <p className="p-4 text-sm text-slate-400">최근 기사 목록이 없습니다.</p>
+                            )}
+                            {optaRecent.map((item) => (
+                              <button key={item.id} type="button" onClick={() => loadOpta(item.id)}
+                                className="w-full text-left p-3 hover:bg-indigo-50/50 transition-colors">
+                                <div className="text-xs text-slate-400">{formatArticleDate(item.publishedAt)}</div>
+                                <div className="text-sm font-medium text-slate-700 leading-snug">{item.title}</div>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+
+                        <p className="text-sm text-slate-500">
+                          💡 분석할 <strong>단락</strong>을 하나 고르세요. 기사 한 편은 한 번에 분석하기엔 너무 깁니다 —
+                          매일 몇 단락씩 끊어 읽는 편이 오히려 남습니다.
+                        </p>
+
+                        <div className="border border-slate-200 rounded-2xl divide-y divide-slate-100 max-h-[28rem] overflow-y-auto">
+                          {optaNumbered.map((para, i) => para.type === 'heading' ? (
+                            <div key={i} className="px-4 pt-4 pb-2 text-xs font-bold tracking-wide text-slate-400">
+                              {para.text}
+                            </div>
+                          ) : (
+                            <button key={i} type="button" onClick={() => gotoParagraph(i)}
+                              className={'w-full text-left p-4 flex gap-3 items-start transition-colors ' + (optaIdx === i ? 'bg-indigo-50' : 'hover:bg-slate-50')}>
+                              <span className={'shrink-0 mt-1 w-6 h-6 rounded-full text-[11px] font-bold flex items-center justify-center ' + (optaDone.indexOf(i) !== -1 ? 'bg-emerald-100 text-emerald-700' : optaIdx === i ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-400')}>
+                                {optaDone.indexOf(i) !== -1 ? '✓' : para.no}
+                              </span>
+                              <span className={'font-serif text-[15px] leading-relaxed ' + (optaIdx === i ? 'text-slate-900' : 'text-slate-600')}>
+                                {para.text}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+
+                        {optaIdx < 0 ? (
+                          <p className="text-sm text-emerald-700 bg-emerald-50 p-3 rounded-xl">
+                            🎉 이 기사는 모든 단락을 분석했어요. 위에서 <strong>다른 기사</strong>를 골라 보세요.
+                          </p>
+                        ) : (
+                          <div className="flex gap-2">
+                            <button type="button" disabled={optaPrev < 0} onClick={() => gotoParagraph(optaPrev)}
+                              className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 text-sm font-medium hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-transparent transition-colors">
+                              ← 이전 단락
+                            </button>
+                            <button type="button" disabled={optaNext < 0} onClick={() => gotoParagraph(optaNext)}
+                              className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 text-sm font-medium hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-transparent transition-colors">
+                              다음 단락 →
+                            </button>
+                          </div>
+                        )}
+                      </>)}
+                    </div>
+                  )}
+
                   {activeTab === 'image' && (
                     <div className="space-y-3">
                       <label className="block text-sm font-semibold text-slate-700">원서 페이지 업로드</label>
@@ -668,7 +877,11 @@
 
                   <button onClick={analyzeContent} disabled={isLoading}
                     className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-bold rounded-2xl shadow-sm hover:shadow-md transition-all flex items-center justify-center gap-2">
-                    {isLoading ? (<><span className="spin inline-block">⏳</span> 전체 문장 분석 중...</>) : (<>전체 분석하기 →</>)}
+                    {isLoading
+                      ? (<><span className="spin inline-block">⏳</span> 분석 중...</>)
+                      : activeTab === 'opta'
+                        ? (<>이 단락 분석하기 →</>)
+                        : (<>전체 분석하기 →</>)}
                   </button>
                 </div>
               </div>
