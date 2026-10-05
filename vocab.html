@@ -105,6 +105,91 @@
 
       const store = isLocalMode ? localVocabStore : supaVocabStore;
 
+      // ── 학습용 예문 ─────────────────────────────────────────────
+      // 단어는 뜻만 봐도 외워지지만 구동사는 '쓰임'을 봐야 외워진다.
+      // 저장해 둔 원문 문장은 길고 어려우므로 쉬운 예문을 따로 만들어 보여 준다.
+      // 캐시 키는 index.html 과 같다 — 한쪽에서 만든 예문을 다른 쪽에서도 그대로 쓴다.
+      const EXAMPLES_KEY = 'chunk-and-catch-examples';
+      const exampleCache = {
+        _load() {
+          try { return JSON.parse(localStorage.getItem(EXAMPLES_KEY)) || {}; }
+          catch (_) { return {}; }
+        },
+        get(term) { return this._load()[String(term).trim().toLowerCase()] || null; },
+        set(term, data) {
+          const db = this._load();
+          db[String(term).trim().toLowerCase()] = data;
+          try { localStorage.setItem(EXAMPLES_KEY, JSON.stringify(db)); } catch (_) {}
+        },
+      };
+
+      // 카드가 빠르게 넘어가도 같은 표현을 두 번 요청하지 않도록 진행 중인 약속을 공유한다.
+      const examplePending = new Map();
+      const fetchExamples = (term, meaning) => {
+        const key = String(term).trim().toLowerCase();
+        const cached = exampleCache.get(key);
+        if (cached) return Promise.resolve(cached);
+        if (examplePending.has(key)) return examplePending.get(key);
+        const p = (async () => {
+          const res = await fetch('/api/examples', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ term, meaning }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error((data && data.error) || ('요청 실패 (' + res.status + ')'));
+          const clean = {
+            examples: (data.examples || []).filter((ex) => ex && ex.en),
+            note: data.note || '',
+          };
+          if (!clean.examples.length) throw new Error('예문을 만들지 못했습니다.');
+          exampleCache.set(key, clean);
+          return clean;
+        })();
+        examplePending.set(key, p);
+        p.catch(() => {}).then(() => examplePending.delete(key));
+        return p;
+      };
+
+      function ExampleBox({ state, onRetry, onSpeak }) {
+        if (!state) return null;
+        if (state.loading) {
+          return (
+            <p className="flex items-center gap-2 text-sm text-slate-400 py-2">
+              <span className="spin inline-block">⏳</span> 쉬운 예문을 만드는 중...
+            </p>
+          );
+        }
+        if (state.error) {
+          return (
+            <button type="button" onClick={onRetry}
+              className="text-sm text-amber-700 bg-amber-50 rounded-xl px-3 py-2 w-full text-left hover:bg-amber-100 transition-colors">
+              ⚠️ {state.error} — 다시 시도
+            </button>
+          );
+        }
+        return (
+          <div className="space-y-2">
+            {state.data.examples.map((ex, i) => (
+              <div key={i} className="flex items-start gap-2 p-3 bg-sky-50/70 border border-sky-100 rounded-xl text-left">
+                <span className="shrink-0 w-5 h-5 mt-0.5 rounded-full bg-sky-100 text-sky-700 text-[11px] font-bold flex items-center justify-center">{i + 1}</span>
+                <div className="flex-1 min-w-0 space-y-0.5">
+                  <p className="font-serif text-[15px] leading-relaxed text-slate-800">{ex.en}</p>
+                  <p className="text-xs text-slate-500 leading-relaxed">{ex.ko}</p>
+                </div>
+                <button type="button" onClick={(e) => { e.stopPropagation(); onSpeak(ex.en); }}
+                  className="shrink-0 text-slate-300 hover:text-sky-600 transition-colors" title="발음 듣기">🔊</button>
+              </div>
+            ))}
+            {state.data.note && (
+              <p className="text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded-xl p-3 leading-relaxed">
+                💡 {state.data.note}
+              </p>
+            )}
+          </div>
+        );
+      }
+
       function LoginForm({ onSubmit, error }) {
         const [email, setEmail] = useState('');
         const [password, setPassword] = useState('');
@@ -150,6 +235,9 @@
         const [dictQuery, setDictQuery] = useState('');
         const [dictResult, setDictResult] = useState(null);
         const [dictLoading, setDictLoading] = useState(false);
+
+        const [exampleMap, setExampleMap] = useState({});  // 표현(소문자) → {loading|data|error}
+        const [openEx, setOpenEx] = useState({});          // 목록에서 예문 펼친 항목
 
         const [deck, setDeck] = useState([]);
         const [cardIdx, setCardIdx] = useState(0);
@@ -302,6 +390,30 @@
           }
           return a;
         };
+        // 예문 가져오기 — 캐시에 있으면 요청 없이 바로 꽂는다.
+        const loadExamples = (term, meaning) => {
+          const key = String(term || '').trim().toLowerCase();
+          if (!key) return;
+          const cur = exampleMap[key];
+          if (cur && (cur.loading || cur.data)) return;
+          const cached = exampleCache.get(key);
+          if (cached) return setExampleMap((m) => ({ ...m, [key]: { data: cached } }));
+          setExampleMap((m) => ({ ...m, [key]: { loading: true } }));
+          fetchExamples(term, meaning)
+            .then((data) => setExampleMap((m) => ({ ...m, [key]: { data } })))
+            .catch((e) => setExampleMap((m) => ({
+              ...m, [key]: { error: (e && e.message) || '예문을 가져오지 못했습니다.' },
+            })));
+        };
+        const exampleState = (term) => exampleMap[String(term || '').trim().toLowerCase()];
+
+        // 카드를 뒤집었을 때 구동사면 예문을 알아서 준비한다.
+        // (단어는 뜻만으로 충분하므로 버튼을 눌렀을 때만 가져온다)
+        useEffect(() => {
+          const c = deck[cardIdx];
+          if (view === 'cards' && flipped && c && c.type === 'idiom') loadExamples(c.term, c.meaning);
+        }, [view, flipped, cardIdx, deck]);
+
         const startCards = (items) => {
           if (!items.length) { setErr('학습할 단어가 없습니다. 필터를 바꾸거나 단어를 추가해 주세요.'); return; }
           setDeck(shuffle(items)); setCardIdx(0); setFlipped(false); setCardResults({});
@@ -473,6 +585,22 @@
                                 {v.source_sentence && (
                                   <p className="mt-1.5 text-xs text-slate-400 italic">{v.source_sentence}</p>
                                 )}
+                                <button type="button"
+                                  onClick={() => {
+                                    const next = !openEx[v.id];
+                                    setOpenEx((o) => ({ ...o, [v.id]: next }));
+                                    if (next) loadExamples(v.term, v.meaning);
+                                  }}
+                                  className="mt-2 text-xs font-medium text-sky-600 hover:text-sky-800 transition-colors">
+                                  {openEx[v.id] ? '예문 접기 ▲' : (v.type === 'idiom' ? '💬 쉬운 예문 보기 ▼' : '💬 예문 보기 ▼')}
+                                </button>
+                                {openEx[v.id] && (
+                                  <div className="mt-2">
+                                    <ExampleBox state={exampleState(v.term)}
+                                      onRetry={() => loadExamples(v.term, v.meaning)}
+                                      onSpeak={(t) => speak(t)} />
+                                  </div>
+                                )}
                               </div>
                               <div className="shrink-0 flex items-center gap-1">
                                 <button onClick={() => speak(v.term)}
@@ -525,6 +653,25 @@
                               </>
                             )}
                           </div>
+                          {flipped && (
+                            <div className="space-y-2">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-xs font-bold text-sky-700">
+                                  💬 {card.type === 'idiom' ? '이 구동사가 쓰이는 쉬운 문장' : '예문'}
+                                </span>
+                                {!exampleState(card.term) && (
+                                  <button type="button" onClick={() => loadExamples(card.term, card.meaning)}
+                                    className="text-xs font-medium text-sky-600 hover:text-sky-800 transition-colors">
+                                    예문 보기 →
+                                  </button>
+                                )}
+                              </div>
+                              <ExampleBox state={exampleState(card.term)}
+                                onRetry={() => loadExamples(card.term, card.meaning)}
+                                onSpeak={(t) => speak(t)} />
+                            </div>
+                          )}
+
                           {flipped && (
                             <div className="grid grid-cols-2 gap-3">
                               <button onClick={() => gradeCard(card, false)}

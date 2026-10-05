@@ -152,6 +152,92 @@
       // 같은 단어인지 판정하는 키 (대소문자 무시)
       const vocabKey = (type, term) => type + '|' + String(term).trim().toLowerCase();
 
+      // ── 학습용 예문 ─────────────────────────────────────────────
+      // 단어는 뜻만 봐도 외워지지만 구동사는 '쓰임'을 봐야 외워진다.
+      // 기사 원문 문장은 길고 어려우므로, 쉬운 예문을 따로 만들어 보여 준다.
+      // 같은 표현의 예문은 늘 같고 사용자 데이터도 아니라서 Supabase 대신 이 기기에 재워 둔다.
+      const EXAMPLES_KEY = 'chunk-and-catch-examples';
+      const exampleCache = {
+        _load() {
+          try { return JSON.parse(localStorage.getItem(EXAMPLES_KEY)) || {}; }
+          catch (_) { return {}; }
+        },
+        get(term) { return this._load()[String(term).trim().toLowerCase()] || null; },
+        set(term, data) {
+          const db = this._load();
+          db[String(term).trim().toLowerCase()] = data;
+          try { localStorage.setItem(EXAMPLES_KEY, JSON.stringify(db)); } catch (_) {}
+        },
+      };
+
+      // 카드가 빠르게 넘어가도 같은 표현을 두 번 요청하지 않도록 진행 중인 약속을 공유한다.
+      const examplePending = new Map();
+      const fetchExamples = (term, meaning) => {
+        const key = String(term).trim().toLowerCase();
+        const cached = exampleCache.get(key);
+        if (cached) return Promise.resolve(cached);
+        if (examplePending.has(key)) return examplePending.get(key);
+        const p = (async () => {
+          const res = await fetch('/api/examples', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ term, meaning }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error((data && data.error) || ('요청 실패 (' + res.status + ')'));
+          const clean = {
+            examples: (data.examples || []).filter((ex) => ex && ex.en),
+            note: data.note || '',
+          };
+          if (!clean.examples.length) throw new Error('예문을 만들지 못했습니다.');
+          exampleCache.set(key, clean);
+          return clean;
+        })();
+        examplePending.set(key, p);
+        p.catch(() => {}).then(() => examplePending.delete(key));
+        return p;
+      };
+
+      // 예문 목록 (단어장 카드·목록에서 같이 쓴다)
+      function ExampleBox({ state, onRetry, onSpeak }) {
+        if (!state) return null;
+        if (state.loading) {
+          return (
+            <p className="flex items-center gap-2 text-sm text-slate-400 py-2">
+              <span className="spin inline-block">⏳</span> 쉬운 예문을 만드는 중...
+            </p>
+          );
+        }
+        if (state.error) {
+          return (
+            <button type="button" onClick={onRetry}
+              className="text-sm text-amber-700 bg-amber-50 rounded-xl px-3 py-2 w-full text-left hover:bg-amber-100 transition-colors">
+              ⚠️ {state.error} — 다시 시도
+            </button>
+          );
+        }
+        return (
+          <div className="space-y-2">
+            {state.data.examples.map((ex, i) => (
+              <div key={i} className="flex items-start gap-2 p-3 bg-sky-50/70 border border-sky-100 rounded-xl text-left">
+                <span className="shrink-0 w-5 h-5 mt-0.5 rounded-full bg-sky-100 text-sky-700 text-[11px] font-bold flex items-center justify-center">{i + 1}</span>
+                <div className="flex-1 min-w-0 space-y-0.5">
+                  <p className="font-serif text-[15px] leading-relaxed text-slate-800">{ex.en}</p>
+                  <p className="text-xs text-slate-500 leading-relaxed">{ex.ko}</p>
+                </div>
+                <button type="button" onClick={(e) => { e.stopPropagation(); onSpeak(ex.en); }}
+                  className="shrink-0 text-slate-300 hover:text-sky-600 transition-colors" title="발음 듣기">🔊</button>
+              </div>
+            ))}
+            {state.data.note && (
+              <p className="text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded-xl p-3 leading-relaxed">
+                💡 {state.data.note}
+              </p>
+            )}
+          </div>
+        );
+      }
+
       // ── Opta(The Analyst) 기사 읽기 진행 상황 ────────────────────
       // 어느 단락까지 분석했는지는 기기별 학습 기록이라 서버에 둘 이유가 없다.
       const OPTA_KEY = 'chunk-and-catch-opta-progress';
@@ -231,6 +317,8 @@
         const [optaIdx, setOptaIdx] = useState(-1);         // 지금 고른 단락 번호 (-1 = 없음)
         const [optaDone, setOptaDone] = useState([]);       // 이미 분석한 단락 번호들
         const [optaPicker, setOptaPicker] = useState(false);
+        const optaListRef = useRef(null);   // 단락 목록 (↑ 단락 목록 버튼이 여기로 데려간다)
+        const resultRef = useRef(null);     // 분석 결과 첫머리
 
         // ── 단어장 상태 ──
         const [view, setView] = useState('analyze');       // analyze | vocab | cards
@@ -243,6 +331,8 @@
         const [revealed, setRevealed] = useState({});       // 뜻 가리기 중 개별 공개
         const [onlyUnknown, setOnlyUnknown] = useState(false);
         // ── 플래시카드 상태 ──
+        const [exampleMap, setExampleMap] = useState({});  // 표현(소문자) → {loading|data|error}
+        const [openEx, setOpenEx] = useState({});          // 단어장 목록에서 예문 펼친 항목
         const [deck, setDeck] = useState([]);
         const [cardIdx, setCardIdx] = useState(0);
         const [flipped, setFlipped] = useState(false);
@@ -439,6 +529,8 @@
                 source_sentence: sourceSentence || null,
               });
               setVocab((list) => [row, ...list]);
+              // 구동사는 곧 예문을 보게 되므로 담을 때 미리 만들어 캐시에 재워 둔다.
+              if (type === 'idiom') fetchExamples(row.term, row.meaning).catch(() => {});
             }
             setVocabError('');
           } catch (e) {
@@ -495,6 +587,23 @@
           }
           return a;
         };
+
+        // 예문 가져오기 — 캐시에 있으면 요청 없이 바로 꽂는다.
+        const loadExamples = (term, meaning) => {
+          const key = String(term || '').trim().toLowerCase();
+          if (!key) return;
+          const cur = exampleMap[key];
+          if (cur && (cur.loading || cur.data)) return;
+          const cached = exampleCache.get(key);
+          if (cached) return setExampleMap((m) => ({ ...m, [key]: { data: cached } }));
+          setExampleMap((m) => ({ ...m, [key]: { loading: true } }));
+          fetchExamples(term, meaning)
+            .then((data) => setExampleMap((m) => ({ ...m, [key]: { data } })))
+            .catch((e) => setExampleMap((m) => ({
+              ...m, [key]: { error: (e && e.message) || '예문을 가져오지 못했습니다.' },
+            })));
+        };
+        const exampleState = (term) => exampleMap[String(term || '').trim().toLowerCase()];
 
         const startCards = (items) => {
           if (!items.length) return;
@@ -556,6 +665,22 @@
           }
         };
 
+        // 카드를 뒤집었을 때 구동사면 예문을 알아서 준비한다.
+        // (단어는 뜻만으로 충분하다고 해서 버튼을 눌렀을 때만 가져온다)
+        useEffect(() => {
+          const card = deck[cardIdx];
+          if (view === 'cards' && flipped && card && card.type === 'idiom') {
+            loadExamples(card.term, card.meaning);
+          }
+        }, [view, flipped, cardIdx, deck]);
+
+        // 분석이 끝나면 결과 첫머리로 데려간다 — 긴 단락 목록을 손으로 지나칠 필요가 없다.
+        useEffect(() => {
+          if (result && resultRef.current) {
+            resultRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        }, [result]);
+
         // 탭을 처음 열 때 한 번만. 실패했으면 '다시 시도' 버튼으로만 재요청한다.
         useEffect(() => {
           if (activeTab === 'opta' && !optaArticle && !optaLoading && !optaError) loadOpta();
@@ -568,17 +693,18 @@
           setTextUsed(false);
         };
 
-        // 기사에서 지금 고른 단락 (없으면 빈 문자열)
         const optaParagraphs = (optaArticle && optaArticle.paragraphs) || [];
-        const optaSelected =
-          optaIdx >= 0 && optaParagraphs[optaIdx] ? optaParagraphs[optaIdx].text : '';
 
-        const analyzeContent = async () => {
+        // 단락 번호를 넘기면 그 단락을, 안 넘기면 지금 고른 단락을 분석한다.
+        // (버튼 onClick 이 이벤트 객체를 넘기므로 숫자인지 확인한다)
+        const analyzeContent = async (optaOverride) => {
+          const useIdx = typeof optaOverride === 'number' ? optaOverride : optaIdx;
+          const useText = useIdx >= 0 && optaParagraphs[useIdx] ? optaParagraphs[useIdx].text : '';
           setError('');
           setResult(null);
           if (activeTab === 'text' && !textInput.trim()) return setError('분석할 영어 문장을 입력해 주세요.');
           if (activeTab === 'image' && !imagePreview) return setError('분석할 이미지를 업로드해 주세요.');
-          if (activeTab === 'opta' && !optaSelected) return setError('분석할 단락을 하나 골라 주세요.');
+          if (activeTab === 'opta' && !useText) return setError('분석할 단락을 하나 골라 주세요.');
 
           setIsLoading(true);
           try {
@@ -586,7 +712,7 @@
             if (activeTab === 'text') {
               body = { mode: 'text', text: textInput };
             } else if (activeTab === 'opta') {
-              body = { mode: 'text', text: optaSelected };
+              body = { mode: 'text', text: useText };
             } else {
               // 선택 영역이 있으면 원본에서 그 부분만 잘라 보낸다 (crop 이 null 이면 전체)
               const shot = await renderImage(originalSrc, crop);
@@ -602,7 +728,7 @@
             if (!data.sentences) throw new Error('결과를 받아오지 못했습니다.');
             setResult(data);
             if (activeTab === 'text') setTextUsed(true);
-            if (activeTab === 'opta') setOptaDone(optaProgress.mark(optaArticle.id, optaIdx));
+            if (activeTab === 'opta') setOptaDone(optaProgress.mark(optaArticle.id, useIdx));
           } catch (e) {
             console.error(e);
             setError(e.message || '분석 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.');
@@ -630,13 +756,25 @@
         const optaNext = optaIdx >= 0 ? optaStep(1) : -1;
         const gotoParagraph = (i) => { setOptaIdx(i); setResult(null); setError(''); };
 
+        // 결과를 다 읽은 자리에서 바로 다음 단락으로 (기사까지 스크롤해 올라갈 필요 없음)
+        const analyzeNext = () => {
+          if (optaNext < 0 || isLoading) return;
+          setOptaIdx(optaNext);
+          analyzeContent(optaNext);
+        };
+        const scrollToList = () => {
+          if (optaListRef.current) optaListRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        };
+        // 결과를 다 읽고 다음 단락으로 넘어갈 수 있는 상태인지 (하단 고정 바 표시 조건)
+        const showOptaBar = view === 'analyze' && activeTab === 'opta' && !!optaArticle && sentences.length > 0;
+
         const cardDone = deck.length > 0 && cardIdx >= deck.length;
         const cardKnownCount = Object.values(cardResults).filter(Boolean).length;
         const cardWrongList = deck.filter((d) => cardResults[d.id] === false);
         const currentCard = deck[cardIdx];
 
         return (
-          <div className="min-h-screen bg-slate-50 text-slate-800 p-4 md:p-8">
+          <div className={'min-h-screen bg-slate-50 text-slate-800 p-4 md:p-8 ' + (showOptaBar ? 'pb-32' : '')}>
             <div className="max-w-4xl mx-auto space-y-6">
 
               <div className="text-center space-y-2 mb-8">
@@ -735,7 +873,8 @@
                           매일 몇 단락씩 끊어 읽는 편이 오히려 남습니다.
                         </p>
 
-                        <div className="border border-slate-200 rounded-2xl divide-y divide-slate-100 max-h-[28rem] overflow-y-auto">
+                        <div ref={optaListRef}
+                          className="border border-slate-200 rounded-2xl divide-y divide-slate-100 max-h-[28rem] overflow-y-auto">
                           {optaNumbered.map((para, i) => para.type === 'heading' ? (
                             <div key={i} className="px-4 pt-4 pb-2 text-xs font-bold tracking-wide text-slate-400">
                               {para.text}
@@ -887,7 +1026,7 @@
               </div>
 
               {sentences.length > 0 && (
-                <div className="space-y-8">
+                <div ref={resultRef} className="space-y-8 scroll-mt-4">
                   <div className="flex items-center gap-2 text-indigo-700 font-bold px-2">
                     📋 <h2 className="text-xl">총 {sentences.length}개의 문장이 분석되었습니다.</h2>
                   </div>
@@ -1072,6 +1211,22 @@
                                 {v.source_sentence && (
                                   <p className="mt-1.5 text-xs text-slate-400 italic truncate">{v.source_sentence}</p>
                                 )}
+                                <button type="button"
+                                  onClick={() => {
+                                    const next = !openEx[v.id];
+                                    setOpenEx((o) => ({ ...o, [v.id]: next }));
+                                    if (next) loadExamples(v.term, v.meaning);
+                                  }}
+                                  className="mt-2 text-xs font-medium text-sky-600 hover:text-sky-800 transition-colors">
+                                  {openEx[v.id] ? '예문 접기 ▲' : (v.type === 'idiom' ? '💬 쉬운 예문 보기 ▼' : '💬 예문 보기 ▼')}
+                                </button>
+                                {openEx[v.id] && (
+                                  <div className="mt-2">
+                                    <ExampleBox state={exampleState(v.term)}
+                                      onRetry={() => loadExamples(v.term, v.meaning)}
+                                      onSpeak={(t) => handleSpeak(t, 'en-US')} />
+                                  </div>
+                                )}
                               </div>
                               <button onClick={() => removeEntry(v.id)}
                                 className="shrink-0 text-slate-300 hover:text-red-500 transition-colors px-1" title="삭제">✕</button>
@@ -1124,6 +1279,25 @@
                       </div>
 
                       {flipped && (
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold text-sky-700">
+                              💬 {currentCard.type === 'idiom' ? '이 구동사가 쓰이는 쉬운 문장' : '예문'}
+                            </span>
+                            {!exampleState(currentCard.term) && (
+                              <button type="button" onClick={() => loadExamples(currentCard.term, currentCard.meaning)}
+                                className="text-xs font-medium text-sky-600 hover:text-sky-800 transition-colors">
+                                예문 보기 →
+                              </button>
+                            )}
+                          </div>
+                          <ExampleBox state={exampleState(currentCard.term)}
+                            onRetry={() => loadExamples(currentCard.term, currentCard.meaning)}
+                            onSpeak={(t) => handleSpeak(t, 'en-US')} />
+                        </div>
+                      )}
+
+                      {flipped && (
                         <div className="grid grid-cols-2 gap-3">
                           <button onClick={() => gradeCard(currentCard, false)}
                             className="py-4 rounded-2xl font-bold bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 transition-colors">
@@ -1163,6 +1337,32 @@
               )}
 
             </div>
+
+            {/* 결과를 다 읽은 그 자리에서 원터치로 다음 단락 — 화면 아래에 늘 붙어 있다 */}
+            {showOptaBar && (
+              <div className="fixed bottom-0 left-0 right-0 z-40 px-4 pt-6 pb-4 bg-gradient-to-t from-slate-50 via-slate-50 to-transparent"
+                style={{ paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }}>
+                <div className="max-w-4xl mx-auto flex gap-2">
+                  <button type="button" onClick={scrollToList}
+                    className="shrink-0 px-4 py-3.5 rounded-2xl bg-white border border-slate-200 text-slate-600 text-sm font-medium shadow-lg hover:border-indigo-300 hover:text-indigo-600 transition-colors">
+                    ↑ 단락 목록
+                  </button>
+                  {optaNext >= 0 ? (
+                    <button type="button" onClick={analyzeNext} disabled={isLoading}
+                      className="flex-1 py-3.5 rounded-2xl bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-bold shadow-lg transition-colors flex items-center justify-center gap-2">
+                      {isLoading
+                        ? (<><span className="spin inline-block">⏳</span> 분석 중...</>)
+                        : (<>다음 단락 분석하기 →</>)}
+                    </button>
+                  ) : (
+                    <button type="button" onClick={() => { setOptaPicker(true); scrollToList(); }}
+                      className="flex-1 py-3.5 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold shadow-lg transition-colors">
+                      🎉 기사 끝 — 다른 기사 고르기
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         );
       }
